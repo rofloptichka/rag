@@ -10,7 +10,10 @@ from lancedb.embeddings import get_registry
 from lancedb.pydantic import LanceModel, Vector
 from openai import OpenAI
 from utils.tokenizer import OpenAITokenizerWrapper
-import json 
+import json
+import unicodedata
+import io
+
 
 load_dotenv()
 
@@ -78,56 +81,52 @@ async def process_document(
     # Create a directory for the company's uploads
     upload_dir = os.path.join("uploads", "documents", companyId)
     os.makedirs(upload_dir, exist_ok=True)
-    
-    # Save the uploaded file locally in the company's folder
-    file_location = os.path.join(upload_dir, file.filename)
-    with open(file_location, "wb") as f:
+
+    # Try decoding filename properly
+    raw_filename = file.filename
+
+    try:
+        safe_filename = raw_filename.encode("latin1").decode("utf-8")
+    except UnicodeDecodeError:
+        safe_filename = raw_filename  # If decoding fails, fallback to original
+
+    print(f"Raw filename: {raw_filename}")
+    print(f"Decoded filename: {safe_filename}")
+
+    # Save the uploaded file locally in UTF-8
+    file_location = os.path.join(upload_dir, safe_filename)
+    with io.open(file_location, "wb") as f:
         f.write(await file.read())
-    
+
     # Process the document using Docling
     try:
         result = converter.convert(file_location)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Document conversion failed: {e}")
-    
+
     document = result.document
 
-    # (Optional) Export markdown for debugging
-    markdown_output = document.export_to_markdown()
-    print("Markdown output:", markdown_output)
+    # Apply hybrid chunking
+    chunker = HybridChunker(tokenizer=tokenizer, max_tokens=MAX_TOKENS, merge_peers=True)
+    chunks = list(chunker.chunk(dl_doc=document))
 
-    # Apply hybrid chunking to split the document into chunks
-    chunker = HybridChunker(
-        tokenizer=tokenizer,
-        max_tokens=MAX_TOKENS,
-        merge_peers=True,
-    )
-    chunk_iter = chunker.chunk(dl_doc=document)
-    chunks = list(chunk_iter)
-
-    # Prepare processed chunks for storage, including metadata
+    # Store metadata correctly
     processed_chunks = [
         {
             "text": chunk.text,
             "metadata": {
-                "filename": chunk.meta.origin.filename,
-                "page_numbers": sorted(
-                    set(
-                        prov.page_no
-                        for item in chunk.meta.doc_items
-                        for prov in item.prov
-                    )
-                ) or None,
+                "filename": safe_filename.encode("utf-8").decode("utf-8"),
+                "page_numbers": sorted(set(prov.page_no for item in chunk.meta.doc_items for prov in item.prov)) or None,
                 "title": chunk.meta.headings[0] if chunk.meta.headings else None,
             },
         }
         for chunk in chunks
     ]
 
-    # Get (or create) the table for the given company and add the chunks
+    # Store in LanceDB
     table = get_company_table(companyId)
     table.add(processed_chunks)
-    
+
     row_count = table.count_rows()
     return {"message": "Document processed and embeddings stored successfully.", "row_count": row_count}
 
