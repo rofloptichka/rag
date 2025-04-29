@@ -1,9 +1,11 @@
-requests
-ipykernel
+fastapi
+uvicorn[standard]
 python-dotenv
 openai
+python-multipart
 pydantic
 docling
 lancedb
-streamlit
 tiktoken
+requests
+google-cloud-storage
