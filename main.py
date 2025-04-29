@@ -3,6 +3,7 @@ import io
 import json
 import base64
 from typing import List
+import hashlib
 
 from fastapi import FastAPI, Form, UploadFile, File, Query, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
@@ -110,12 +111,19 @@ def safe_decode_filename(filename: str) -> str:
         return filename  # If decoding fails, return the original
     
 
-def upload_to_gcs(content: bytes, company_id: str, folder: str, filename: str) -> str:
+def upload_to_gcs(
+    content: bytes,
+    company_id: str,
+    folder: str,
+    filename: str,
+    content_type: str
+) -> str:
     path = f"uploads/{company_id}/{folder}/{filename}"
     blob = bucket.blob(path)
-    blob.upload_from_string(content)
-    # не делаем public, возвращаем внутренний gs:// URL
+    # Передаём правильный MIME-тип, чтобы PDF, картинки и т.п. рендерились корректно
+    blob.upload_from_string(content, content_type=content_type)
     return f"gs://{bucket.name}/{path}"
+
 
 # ------------------------------------------------------------------------------
 # Эндпоинты для документов (docling_{companyId})
@@ -259,7 +267,13 @@ async def process_sendable_file(
 
     # 2) Читаем содержимое и заливаем в GCS
     content = await file.read()
-    gcs_url = upload_to_gcs(content, companyId, "sendables", safe_name)
+    gcs_url = upload_to_gcs(
+        content,
+        companyId,
+        "sendables",
+        safe_name,
+        file.content_type or "application/octet-stream"
+    )
 
     # 3) Генерим embedding описания
     emb_resp = client.embeddings.create(
