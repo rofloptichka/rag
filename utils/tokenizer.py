@@ -36,6 +36,13 @@ class OpenAITokenizerWrapper(PreTrainedTokenizerBase):
 
     def get_vocab(self) -> Dict[str, int]:
         return dict(enumerate(range(self.vocab_size)))
+    
+    def __len__(self) -> int:
+        """
+        Returns the vocabulary size.
+        """
+        return self.vocab_size
+    # -----------------------
 
     @property
     def vocab_size(self) -> int:
