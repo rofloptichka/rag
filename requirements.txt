@@ -9,3 +9,4 @@ lancedb
 tiktoken
 requests
 google-cloud-storage
+cloudinary

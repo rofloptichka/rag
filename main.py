@@ -1,19 +1,22 @@
 import os
+import re
 import io
 import json
 import base64
-from typing import List
 import hashlib
 import urllib.parse
+from pydantic import BaseModel
 
 from fastapi import FastAPI, Form, UploadFile, File, Query, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from dotenv import load_dotenv
 
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
+
 import lancedb
 from lancedb.embeddings import get_registry
-from lancedb.pydantic import LanceModel, Vector
-
 from docling.document_converter import DocumentConverter
 from docling.chunking import HybridChunker
 
@@ -34,7 +37,7 @@ load_dotenv()
 # ------------------------------------------------------------------------------
 client = OpenAI()  # берет OPENAI_API_KEY из .env
 tokenizer = OpenAITokenizerWrapper()
-MAX_TOKENS = 8191
+MAX_TOKENS = 512
 converter = DocumentConverter()
 
 b64_key = os.environ["GOOGLE_CLOUD_KEY"]
@@ -50,6 +53,13 @@ func = get_registry().get("openai").create(name="text-embedding-3-large")
 
 app = FastAPI()
 
+cloudinary.config(
+  cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"),
+  api_key = os.getenv("CLOUDINARY_API_KEY"),
+  api_secret = os.getenv("CLOUDINARY_API_SECRET"),
+  secure=True # Recommended to use HTTPS
+)
+
 # ------------------------------------------------------------------------------
 # Pydantic-схемы для таблиц
 # ------------------------------------------------------------------------------
@@ -64,6 +74,9 @@ class Chunks(LanceModel):
     vector: Vector(func.ndims()) = func.VectorField()  # type: ignore
     metadata: ChunkMetadata
 
+class UpdateSendableDescription(BaseModel):
+    new_description: str
+
 # Alternative approach - use a separate field for page numbers
 class ChunkMetadataAlt(LanceModel):
     filename: Optional[str] = None
@@ -77,14 +90,17 @@ class ChunksAlt(LanceModel):
     page_numbers: Optional[str] = None 
 
 class SendableMetadata(LanceModel):
+    index: Optional[str] = None 
     file_type: str | None
     filename: str | None
-    url: str | None
+    url: str | None # GCS URL
+    cloudinary_url: Optional[str] = None
+    cloudinary_public_id: Optional[str] = None
 
 class SendableFile(LanceModel):
     text: str = func.SourceField()
     vector: Vector(func.ndims()) = func.VectorField()  # type: ignore
-    metadata: SendableMetadata
+    metadata: Optional[SendableMetadata] = None
 
 # ------------------------------------------------------------------------------
 # Хелпер-функции
@@ -129,7 +145,7 @@ def upload_to_gcs(content: bytes, company_id: str, folder: str, filename: str, c
     blob.upload_from_string(content, content_type=content_type)
     return f"gs://{bucket.name}/{path}"
 
-# @app.post("/{companyId}/delete-all") # для удаления всех таблиц компании
+@app.delete("/{companyId}/fuckdrop") # для удаления всех таблиц компании
 def clear_company_tables(companyId: str):
     """Clear existing tables for a company to fix schema issues."""
     doc_table_name = f"docling_{companyId}"
@@ -396,6 +412,7 @@ async def download_document(companyId: str, filename: str = Query(...)):
 # ------------------------------------------------------------------------------
 # Эндпоинты для «sendable-files» (sendable_files_{companyId})
 # ------------------------------------------------------------------------------
+
 @app.post("/companies/{companyId}/process-sendable-file")
 async def process_sendable_file(
     companyId:   str,
@@ -405,16 +422,43 @@ async def process_sendable_file(
     safe_name = safe_decode_filename(file.filename)
     table     = get_company_sendable_table(companyId)
 
-    # 1) Проверяем, не загружали ли уже этот файл
-    #    — вытягиваем все записи в DataFrame и фильтруем по metadata.filename
+    # 1) Check for duplicates and get existing data
     df = table.to_pandas()
     if df["metadata"].apply(lambda md: md.get("filename") == safe_name).any():
         raise HTTPException(
             status_code=400,
-            detail=f"Sendable '{safe_name}' уже обработан для компании {companyId}"
+            detail=f"Sendable '{safe_name}' already processed for company {companyId}"
         )
 
-    # 2) Читаем содержимое и заливаем в GCS
+    ### NEW: Generate a unique, sequential index for the sendable ###
+    # 1.1) Calculate the next index
+    max_index = 0
+    if not df.empty:
+        # Extract numeric part from indices like 'SENDABLE-123'
+        # This is robust and handles cases where the index key might be missing
+        # or malformed in older records.
+        all_indices = []
+        for md in df["metadata"]:
+            index_str = md.get("index")
+            if index_str and index_str.startswith("SF-"):
+                try:
+                    # Extract the number part and convert to integer
+                    num = int(index_str.split('-')[1])
+                    all_indices.append(num)
+                except (ValueError, IndexError):
+                    # Ignore malformed indices
+                    pass
+        
+        if all_indices:
+            max_index = max(all_indices)
+
+    # The new index is the highest existing index + 1
+    new_index_num = max_index + 1
+    sendable_index = f"SF-{new_index_num}"
+    ### END NEW ###
+
+
+    # 2) Read content and upload to GCS
     content = await file.read()
     gcs_url = upload_to_gcs(
         content,
@@ -424,30 +468,122 @@ async def process_sendable_file(
         file.content_type or "application/octet-stream"
     )
 
-    # 3) Генерим embedding описания
+    # 2.1) If the file is an image, upload to Cloudinary as well
+    cloudinary_url = None
+    cloudinary_public_id = None
+    if file.content_type and file.content_type.startswith("image/"):
+        try:
+            folder = f"uploads/{companyId}/sendables"
+            upload_result = cloudinary.uploader.upload(
+                content,
+                folder=folder,
+                public_id=os.path.splitext(safe_name)[0],
+                resource_type="image"
+            )
+            cloudinary_url = upload_result.get("secure_url")
+            cloudinary_public_id = upload_result.get("public_id")
+        except Exception as e:
+            print(f"Error uploading to Cloudinary: {e}")
+
+
+    # 3) Generate embedding for the description
     emb_resp = client.embeddings.create(
         model="text-embedding-3-large",
         input=description
     )
     embedding = emb_resp.data[0].embedding
 
-    # 4) Готовим запись и сохраняем в LanceDB
+    # 4) Prepare record and save to LanceDB
+    ### MODIFIED ###
+    metadata_obj = SendableMetadata(
+        index=sendable_index,
+        file_type=(file.content_type or os.path.splitext(safe_name)[1]),
+        filename=safe_name,
+        url=gcs_url
+    )
+
+    if cloudinary_url:
+        metadata_obj.cloudinary_url = cloudinary_url
+        metadata_obj.cloudinary_public_id = cloudinary_public_id
+
+    # В запись передаем уже готовый, валидный объект
     record = {
         "text":    description,
         "vector":  embedding,
-        "metadata": {
-            "file_type": file.content_type or os.path.splitext(safe_name)[1],
-            "filename":  safe_name,
-            "url":       gcs_url
-        }
+        "metadata": metadata_obj.model_dump() 
     }
     table.add([record])
 
+    ### MODIFIED ###
     return {
-        "message":   "Sendable файл обработан и сохранён.",
+        "message":   "Sendable file processed and saved.",
         "row_count": table.count_rows(),
-        "url" : gcs_url
+        "index":     sendable_index, # Return the new index in the response
+        "url": gcs_url,
+        "cloudinary_url": cloudinary_url
     }
+
+# The update endpoint does not need any changes.
+# The index is a permanent identifier stored in metadata.
+# This endpoint correctly only updates the 'text' and 'vector',
+# leaving the original metadata (including the index) intact.
+@app.put("/companies/{companyId}/update-sendable-description")
+async def update_sendable_description(
+    companyId: str,
+    data: UpdateSendableDescription,
+    filename: str = Query(...),
+   
+):
+    """
+    Updates the description for a sendable file.
+    """
+    table = get_company_sendable_table(companyId)
+    safe_name = safe_decode_filename(filename)
+
+    new_description = data.new_description
+
+    # 1) Find the record to update
+    df = table.to_pandas()
+    rows_to_update = df[df["metadata"].apply(lambda md: md.get("filename") == safe_name)]
+
+    if len(rows_to_update) == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No sendable with filename '{safe_name}' found."
+        )
+    elif len(rows_to_update) > 1:
+        # This should ideally never happen, but handle the edge case
+        raise HTTPException(
+            status_code=500,
+            detail=f"Multiple sendables with filename '{safe_name}' found.  Data integrity issue."
+        )
+
+    # Get the row's LanceDB internal ID to facilitate the update operation
+    record_id = rows_to_update.index[0]
+
+    # 2) Recalculate embedding for the new description
+    emb_resp = client.embeddings.create(
+        model="text-embedding-3-large",
+        input=new_description
+    )
+    new_embedding = emb_resp.data[0].embedding
+
+    # 3) Perform the update
+    try:
+        # Update the row in LanceDB. This only updates the text and vector.
+        table.update(
+            where=f"metadata.filename == '{safe_name}'",
+            values={"text": new_description, "vector": new_embedding} # Update both text and vector
+        )
+
+        return {"message": f"Description for '{safe_name}' updated successfully."}
+
+    except Exception as e:
+        print(f"Update failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update description: {e}"
+        )
 
 @app.get("/companies/{companyId}/search-sendable")
 async def search_sendable(
@@ -472,6 +608,7 @@ async def search_sendable(
     for _, row in df.iterrows():
         md = row["metadata"]
         results.append({
+            "index":     md.get("index"),
             "text":      row["text"],
             "filename":  md["filename"],
             "file_type": md["file_type"],
@@ -481,36 +618,121 @@ async def search_sendable(
 
     return {"results": results}
 
+
+@app.get("/companies/{companyId}/search-sendable-index")
+async def search_sendable_by_index(
+    companyId: str,
+    query:     str = Query(..., description="The exact index to search for, e.g., 'SF-1' or 'SF-45'"),
+    # The limit is kept for consistency, but for an index search, we expect only one result.
+    limit:     int = Query(1) 
+):
+    """
+    Searches for a single sendable file by its unique string index (e.g., 'SF-1').
+    This is a direct metadata filter, not a vector search.
+    """
+    table = get_company_sendable_table(companyId)
+
+    # 1) Build a filter query to find the exact index in the metadata.
+    #    This is much faster than a vector search.
+    filter_q = f"metadata.index = '{query}'"
+
+    # 2) Execute the search using the .where() clause.
+    #    .to_list() is lightweight for retrieving a small number of records.
+    found_records = table.search().where(filter_q).limit(limit).to_list()
+
+    # 3) Check if a record was found.
+    if not found_records:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No sendable file found with index '{query}' for company {companyId}."
+        )
+
+    # 4) Format and return the single result.
+    #    The client-side code expects the data object directly.
+    record = found_records[0]
+    metadata = record.get("metadata", {})
+    
+    # We construct a response object similar to the vector search for consistency.
+    result = {
+        "index":     metadata.get("index"),
+        "text":      record.get("text"),
+        "filename":  metadata.get("filename"),
+        "file_type": metadata.get("file_type"),
+        "url":       metadata.get("url"),
+        "cloudinary_url": metadata.get("cloudinary_url")
+    }
+
+    return result
+# ==============================================================================
+#  MODIFIED: delete_sendable
+# ==============================================================================
 @app.delete("/companies/{companyId}/delete-sendable")
 async def delete_sendable(
     companyId: str,
-    filename:  str = Query(...)
+    filename:  Optional[str] = Query(None),
+    index:     Optional[str] = Query(None)
 ):
-    # 0) Подготовка
-    safe_name = safe_decode_filename(filename)
-    table     = get_company_sendable_table(companyId)
+    ### NEW: Validate input ###
+    # Ensure exactly one identifier is provided
+    if not (filename or index) or (filename and index):
+        raise HTTPException(
+            status_code=400,
+            detail="You must provide exactly one of 'filename' or 'index'."
+        )
 
-    # 1) Считаем, сколько записей соответствует filename
-    df = table.to_pandas()
-    deleted_count = int(
-        df["metadata"]
-          .apply(lambda md: md.get("filename") == safe_name)
-          .sum()
-    )
+    table = get_company_sendable_table(companyId)
 
-    # 2) Удаляем из LanceDB
-    filter_q = f"metadata.filename = '{safe_name}'"
+    # 1) Determine filter query and user-facing identifier
+    if filename:
+        safe_name = safe_decode_filename(filename)
+        filter_q = f"metadata.filename = '{safe_name}'"
+        identifier = f"filename '{safe_name}'"
+    else: # We know index is not None here because of the validation above
+        filter_q = f"metadata.index = '{index}'"
+        identifier = f"index '{index}'"
+
+    # 2) Find the record(s) to delete *before* deleting from the DB
+    # We need the metadata to clean up GCS and Cloudinary
+    # Using .search().where() is more efficient than loading the whole table to pandas
+    records_to_delete = table.search().where(filter_q).to_list()
+    
+    deleted_count = len(records_to_delete)
+    if deleted_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No sendable found with {identifier} for deletion."
+        )
+
+    # 3) Delete associated cloud assets (GCS and Cloudinary)
+    for record in records_to_delete:
+        metadata = record.get("metadata", {})
+        
+        # 3.1) Delete from Cloudinary if applicable
+        public_id = metadata.get("cloudinary_public_id")
+        if public_id:
+            try:
+                cloudinary.uploader.destroy(public_id, resource_type="image")
+                print(f"Successfully deleted {public_id} from Cloudinary.")
+            except Exception as e:
+                print(f"Error deleting {public_id} from Cloudinary: {e}")
+
+        # 3.2) Delete blob from GCS
+        gcs_filename = metadata.get("filename")
+        if gcs_filename:
+            path = f"uploads/{companyId}/sendables/{gcs_filename}"
+            try:
+                bucket.blob(path).delete()
+                print(f"Successfully deleted {path} from GCS.")
+            except Exception as e:
+                print(f"Failed to delete {path} from GCS: {e}")
+
+    # 4) Delete from LanceDB (now that cloud assets are gone)
     table.delete(filter_q)
 
-    # 3) Удаляем blob в GCS
-    path = f"uploads/{companyId}/sendables/{safe_name}"
-    bucket.blob(path).delete()
-
     return {
-        "message":      f"Удалено {deleted_count} записей и файл из GCS",
+        "message": f"Successfully deleted {deleted_count} record(s) and associated files for {identifier}.",
         "rows_deleted": deleted_count
     }
-
 # ------------------------------------------------------------------------------
 # Транскрипция без сохранения
 # ------------------------------------------------------------------------------
@@ -569,6 +791,7 @@ async def list_documents(companyId: str):
     # 3) Group by filename to get unique documents
     documents = {}
     for _, row in df.iterrows():
+        metadata = row.get('metadata') or {}
         filename = row["metadata"]["filename"]
         if filename not in documents:
             documents[filename] = {
@@ -584,29 +807,20 @@ async def list_documents(companyId: str):
 
 @app.get("/companies/{companyId}/sendables/list")
 async def list_sendables(companyId: str):
-    """
-    Returns a list of 'sendable' records from the database (sendable_files_{companyId}),
-    including each file's name and description.
-    """
-    # 1) Open the LanceDB table for this company
     sendable_table = get_company_sendable_table(companyId)
-    
-    # 2) Convert all rows to a DataFrame (or you can do a search().limit(...) if needed)
     df = sendable_table.to_pandas()
     
-    # 3) Build a serializable list of {filename, description, ...}
     results = []
     for _, row in df.iterrows():
         metadata = row['metadata']
-        # 'text' holds the user's description,
-        # 'metadata.filename' is the original filename,
-        # 'metadata.url' is the file's public URL (if you assigned it),
-        # 'metadata.file_type' might be ".pdf", ".png", etc.
         result_item = {
-            "filename": metadata["filename"],
-            "description": row["text"],
-            "file_type": metadata["file_type"],
-            "url": metadata["url"]
+            "index": metadata.get("index"),
+            "filename": metadata.get("filename"),
+            "text": row["text"],
+            "file_type": metadata.get("file_type"),
+            "url": metadata.get("url"), # GCS URL
+            "cloudinary_url": metadata.get("cloudinary_url")
+
         }
         results.append(result_item)
 
