@@ -8,7 +8,7 @@ import urllib.parse
 from pydantic import BaseModel
 
 from fastapi import FastAPI, Form, UploadFile, File, Query, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from dotenv import load_dotenv
 
 import cloudinary
@@ -26,7 +26,7 @@ from utils.tokenizer import OpenAITokenizerWrapper
 from google.oauth2 import service_account
 from google.cloud import storage
 
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Tuple
 import pyarrow as pa
 from lancedb.pydantic import LanceModel, Vector
 
@@ -59,6 +59,412 @@ cloudinary.config(
   api_secret = os.getenv("CLOUDINARY_API_SECRET"),
   secure=True # Recommended to use HTTPS
 )
+
+# ------------------------------------------------------------------------------
+# Feature flags and config (env-driven)
+# ------------------------------------------------------------------------------
+def _parse_bool_env(value: Optional[str], default: bool) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+RAG_USE_LLM_UNDERSTAND_DEFAULT = _parse_bool_env(os.getenv("RAG_USE_LLM_UNDERSTAND"), False)
+RAG_NATURAL_CHUNKING_DEFAULT   = _parse_bool_env(os.getenv("RAG_NATURAL_CHUNKING"), True)
+RAG_LLM_RESTRUCTURE_DEFAULT    = _parse_bool_env(os.getenv("RAG_LLM_RESTRUCTURE"), True)
+RAG_SOFT_MAX_TOKENS            = int(os.getenv("RAG_SOFT_MAX_TOKENS", "900"))
+RAG_HARD_MAX_TOKENS            = int(os.getenv("RAG_HARD_MAX_TOKENS", "1800"))
+LLM_SUM_MODEL                  = os.getenv("LLM_SUM_MODEL", "gpt-4.1-mini")
+
+# OpenAI reranker configuration
+OPENAI_RERANKER_ENABLED        = _parse_bool_env(os.getenv("OPENAI_RERANKER_ENABLED"), False)
+OPENAI_RERANKER_MODEL          = os.getenv("OPENAI_RERANKER_MODEL", "gpt-4o-mini")
+OPENAI_RERANKER_TOP_K          = int(os.getenv("OPENAI_RERANKER_TOP_K", "20"))
+OPENAI_RERANKER_TIMEOUT        = int(os.getenv("OPENAI_RERANKER_TIMEOUT", "15"))
+
+# ------------------------------------------------------------------------------
+# Sentence splitting utilities (blingfire if available, regex fallback)
+# ------------------------------------------------------------------------------
+try:
+    import blingfire  # type: ignore
+    _BLINGFIRE_AVAILABLE = True
+except Exception:
+    _BLINGFIRE_AVAILABLE = False
+
+def _split_into_sentences(text: str) -> List[str]:
+    """Split text into sentences without losing punctuation. Prefer blingfire if available."""
+    if not text:
+        return []
+    try:
+        if _BLINGFIRE_AVAILABLE:
+            # blingfire.text_to_sentences returns sentences separated by newlines
+            sents = blingfire.text_to_sentences(text).splitlines()
+            # Strip but keep punctuation at end
+            return [s.strip() for s in sents if s.strip()]
+    except Exception:
+        pass
+    # Fallback: simple regex that tries to keep common sentence endings
+    # This is not perfect but avoids splitting inside numbers/abbreviations most of the time
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-ZА-ЯЁ0-9(])", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+def _count_tokens(text: str) -> int:
+    # Using the existing OpenAI tokenizer wrapper to approximate token count
+    try:
+        return len(tokenizer.tokenize(text))
+    except Exception:
+        # Very safe fallback
+        return max(1, len(text) // 4)
+
+# ------------------------------------------------------------------------------
+# SSE helpers
+# ------------------------------------------------------------------------------
+def _sse_format(event: str, data: Any) -> str:
+    try:
+        payload = json.dumps(data, ensure_ascii=False)
+    except Exception:
+        payload = json.dumps({"message": str(data)})
+    return f"event: {event}\ndata: {payload}\n\n"
+
+# ------------------------------------------------------------------------------
+# OpenAI reranker service
+# ------------------------------------------------------------------------------
+def _openai_rerank(query: str, documents: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, Any]]:
+    """
+    Rerank documents using OpenAI GPT-4o-mini for relevance scoring.
+    Returns reranked documents with updated scores.
+    """
+    if not OPENAI_RERANKER_ENABLED or len(documents) <= 1:
+        return documents[:top_k]
+    
+    try:
+        # Prepare documents for OpenAI with numbering
+        doc_list = []
+        for i, doc in enumerate(documents):
+            text_preview = doc.get("text", "")[:300]  # Limit to 300 chars
+            title = doc.get("title", "Без названия")
+            filename = doc.get("filename", "")
+            
+            doc_summary = f"[{i}] Раздел: {title}\nФайл: {filename}\nТекст: {text_preview}..."
+            doc_list.append(doc_summary)
+        
+        # Create reranking prompt
+        docs_text = "\n\n".join(doc_list)
+        
+        prompt = f"""Вы - эксперт по поиску в медицинской базе знаний. Оцените релевантность каждого документа к запросу пользователя.
+
+ЗАПРОС: "{query}"
+
+ДОКУМЕНТЫ:
+{docs_text}
+
+Верните JSON со списком индексов документов, отсортированных по релевантности (от самого релевантного к менее релевантному). Включите только {min(top_k, len(documents))} самых релевантных документов.
+
+Формат ответа:
+{{"rankings": [
+    {{"index": 0, "relevance_score": 0.95, "reason": "краткое объяснение"}},
+    {{"index": 2, "relevance_score": 0.87, "reason": "краткое объяснение"}}
+]}}"""
+
+        response = client.chat.completions.create(
+            model=OPENAI_RERANKER_MODEL,
+            messages=[
+                {"role": "system", "content": "Вы эксперт по медицинской информации. Оцените релевантность документов точно и объективно."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            timeout=OPENAI_RERANKER_TIMEOUT
+        )
+        
+        result_text = response.choices[0].message.content
+        result = json.loads(result_text)
+        
+        reranked_docs = []
+        for ranking in result.get("rankings", []):
+            doc_idx = ranking.get("index")
+            relevance_score = ranking.get("relevance_score", 0.0)
+            reason = ranking.get("reason", "")
+            
+            if 0 <= doc_idx < len(documents):
+                reranked_doc = documents[doc_idx].copy()
+                reranked_doc["rerank_score"] = relevance_score
+                reranked_doc["rerank_reason"] = reason
+                # Keep original vector score for comparison
+                reranked_doc["vector_score"] = reranked_doc.get("score", 0.0)
+                reranked_doc["score"] = relevance_score  # Use rerank score as primary
+                reranked_docs.append(reranked_doc)
+        
+        print(f"OpenAI reranked {len(documents)} -> {len(reranked_docs)} documents")
+        return reranked_docs[:top_k]
+        
+    except Exception as e:
+        print(f"OpenAI reranker error: {str(e)}")
+        return documents[:top_k]
+
+# ------------------------------------------------------------------------------
+# Markdown-based section/paragraph extraction
+# ------------------------------------------------------------------------------
+def _extract_sections_from_markdown(md: str) -> List[Dict[str, Any]]:
+    """
+    Parse markdown into sections and paragraphs. We keep it conservative and
+    language-agnostic. Returns a list of sections:
+      [{
+          'title': str,
+          'level': int,  # heading level 1..6
+          'paragraphs': [
+              { 'text': str, 'para_idx': int }
+          ],
+          'section_idx': int
+      }]
+    """
+    lines = md.splitlines()
+    sections: List[Dict[str, Any]] = []
+    current_title = None
+    current_level = 1
+    current_paragraph_lines: List[str] = []
+    section_idx = -1
+    para_idx = 0
+
+    def _flush_paragraph():
+        nonlocal para_idx, current_paragraph_lines
+        if current_paragraph_lines and section_idx >= 0:
+            paragraph_text = "\n".join(current_paragraph_lines).strip()
+            if paragraph_text:
+                sections[section_idx]["paragraphs"].append({
+                    "text": paragraph_text,
+                    "para_idx": para_idx,
+                })
+                para_idx += 1
+        current_paragraph_lines = []
+
+    def _start_new_section(title: Optional[str], level: int):
+        nonlocal section_idx, para_idx
+        sections.append({
+            "title": title.strip() if title else None,
+            "level": level,
+            "paragraphs": [],
+            "section_idx": len(sections),
+        })
+        section_idx = len(sections) - 1
+        para_idx = 0
+
+    for ln in lines:
+        # Heading detection (e.g., #, ##, ###)
+        m = re.match(r"^(#{1,6})\s+(.*)$", ln)
+        if m:
+            # Finish previous paragraph before starting a new section
+            _flush_paragraph()
+            current_title = m.group(2).strip()
+            current_level = len(m.group(1))
+            _start_new_section(current_title, current_level)
+            continue
+
+        # Blank line => paragraph boundary
+        if not ln.strip():
+            _flush_paragraph()
+            continue
+
+        # Accumulate paragraph lines; start default section if none yet
+        if section_idx < 0:
+            _start_new_section(title=None, level=1)
+        current_paragraph_lines.append(ln)
+
+    # Flush tail
+    _flush_paragraph()
+
+    # If no sections at all, create one default section from entire text
+    if not sections and md.strip():
+        sections = [{
+            "title": None,
+            "level": 1,
+            "paragraphs": [{"text": md.strip(), "para_idx": 0}],
+            "section_idx": 0,
+        }]
+    return sections
+
+# ------------------------------------------------------------------------------
+# Natural chunking: pack by paragraphs/sentences with soft/hard token limits
+# ------------------------------------------------------------------------------
+def _build_natural_chunks(
+    sections: List[Dict[str, Any]],
+    soft_max_tokens: int,
+    hard_max_tokens: int,
+) -> List[Dict[str, Any]]:
+    """
+    Returns a list of chunks:
+      [{ 'text': str,
+         'section_title': Optional[str],
+         'paragraph_range': Tuple[int, int],  # inclusive indices within section
+         'sentence_range': Tuple[int, int],   # inclusive indices within packed stream
+      }]
+    """
+    chunks: List[Dict[str, Any]] = []
+
+    for section in sections:
+        section_title = section.get("title")
+        # Pack across paragraphs, but never split sentences
+        current_text_parts: List[str] = []
+        current_tokens = 0
+        current_para_start = None
+        current_sent_start = 0
+        sent_counter = 0
+
+        for para in section.get("paragraphs", []):
+            para_text = para.get("text", "").strip()
+            if not para_text:
+                continue
+            sentences = _split_into_sentences(para_text)
+            if not sentences:
+                continue
+
+            # Try to add whole paragraph if possible
+            para_token_count = _count_tokens(para_text)
+            if para_token_count <= soft_max_tokens and (current_tokens + para_token_count) <= hard_max_tokens:
+                if current_para_start is None:
+                    current_para_start = para["para_idx"]
+                current_text_parts.append(para_text)
+                current_tokens += para_token_count
+                sent_counter += len(sentences)
+                continue
+
+            # Otherwise, add sentence-by-sentence
+            for si, sentence in enumerate(sentences):
+                sent_tokens = _count_tokens(sentence)
+                # If adding this sentence bursts the hard limit, flush current chunk first
+                if current_text_parts and (current_tokens + sent_tokens) > hard_max_tokens:
+                    chunks.append({
+                        "text": "\n\n".join(current_text_parts),
+                        "section_title": section_title,
+                        "paragraph_range": (
+                            current_para_start if current_para_start is not None else para["para_idx"],
+                            para["para_idx"] if si == 0 else para["para_idx"],
+                        ),
+                        "sentence_range": (current_sent_start, sent_counter - 1),
+                    })
+                    current_text_parts = []
+                    current_tokens = 0
+                    current_para_start = None
+                    current_sent_start = sent_counter
+
+                if current_para_start is None:
+                    current_para_start = para["para_idx"]
+                current_text_parts.append(sentence)
+                current_tokens += sent_tokens
+                sent_counter += 1
+
+                # If we crossed soft cap, consider flushing to keep chunks coherent
+                if current_tokens >= soft_max_tokens:
+                    chunks.append({
+                        "text": "\n\n".join(current_text_parts),
+                        "section_title": section_title,
+                        "paragraph_range": (
+                            current_para_start if current_para_start is not None else para["para_idx"],
+                            para["para_idx"],
+                        ),
+                        "sentence_range": (current_sent_start, sent_counter - 1),
+                    })
+                    current_text_parts = []
+                    current_tokens = 0
+                    current_para_start = None
+                    current_sent_start = sent_counter
+
+        # Flush remainder for the section
+        if current_text_parts:
+            chunks.append({
+                "text": "\n\n".join(current_text_parts),
+                "section_title": section_title,
+                "paragraph_range": (
+                    current_para_start if current_para_start is not None else 0,
+                    section["paragraphs"][len(section["paragraphs"]) - 1]["para_idx"] if section.get("paragraphs") else 0,
+                ),
+                "sentence_range": (current_sent_start, sent_counter - 1 if sent_counter > 0 else 0),
+            })
+
+    return chunks
+
+# ------------------------------------------------------------------------------
+# LLM document restructuring for clean knowledge base
+# ------------------------------------------------------------------------------
+def _llm_restructure_document(markdown_text: str) -> str:
+    """
+    Use LLM to restructure the entire document into clean, well-organized sections
+    with clear topic separation for better chunking.
+    """
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_SUM_MODEL,
+            messages=[
+                {
+                    "role": "system", 
+                    "content": (
+                        "You are a knowledge base organizer. The headers you organize will be as separate chunks for an LLM's context. Try to preserve all needed context to LLM about one thing in one header.Restructure the given document into "
+                        "clear, well-separated sections with proper headings. Each section should focus on "
+                        "ONE specific topic. CRITICALLY IMPORTANT: Preserve ALL elements. DO NOT DELETE ANYTHING."
+                        "Use markdown format with ## headings. Preserve ALL original information including "
+                        "conversational scripts, pricing discussions, and sales elements. Just organize it logically by topic."
+                    )
+                },
+                {
+                    "role": "user", 
+                    "content": (
+                        "Restructure this document into clean sections with proper topic separation. "
+                        "PRESERVE ALL conversational scripts, customer questions, staff responses, pricing info, "
+                        "and sales techniques. Just organize by topic with clear ## headings:\n\n" + 
+                        markdown_text
+                    )
+                },
+            ],
+            temperature=0.1,
+            max_tokens=4000,
+        )
+        restructured = resp.choices[0].message.content if resp.choices else None
+        if restructured:
+            print(f"LLM restructured document: {len(restructured)} chars")
+            return restructured
+        else:
+            print("LLM restructuring failed, using original")
+            return markdown_text
+    except Exception as e:
+        print(f"LLM restructuring error: {e}")
+        return markdown_text
+
+# ------------------------------------------------------------------------------
+# Optional: LLM understanding pass per section (best-effort, non-blocking)
+# ------------------------------------------------------------------------------
+def _llm_understand_sections(sections: List[Dict[str, Any]], max_sections: int = 50) -> Dict[str, Any]:
+    insights: Dict[str, Any] = {"sections": []}
+    used = 0
+    for s in sections:
+        if used >= max_sections:
+            break
+        section_text = "\n\n".join(p.get("text", "") for p in s.get("paragraphs", []))
+        if not section_text.strip():
+            continue
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {"role": "system", "content": "You are a precise document analyst. Do not invent information."},
+                    {"role": "user", "content": (
+                        "Summarize the following section conservatively in JSON with keys: summary (1-2 sentences), "
+                        "key_terms (up to 10 terms), acronyms (map of acronym->expansion).\n\n" + section_text
+                    )},
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            content = resp.choices[0].message.content if resp.choices else None
+            data = json.loads(content) if content else {}
+            insights["sections"].append({
+                "section_idx": s.get("section_idx"),
+                "title": s.get("title"),
+                "insight": data,
+            })
+            used += 1
+        except Exception:
+            # Non-blocking: ignore failures
+            continue
+    return insights
 
 # ------------------------------------------------------------------------------
 # Pydantic-схемы для таблиц
@@ -173,7 +579,16 @@ def clear_company_tables(companyId: str):
 # Document Processing Endpoint
 # ------------------------------------------------------------------------------
 @app.post("/companies/{companyId}/process-document")
-async def process_document(companyId: str, file: UploadFile = File(...)):
+async def process_document(
+    companyId: str,
+    file: UploadFile = File(...),
+    llmEnrich: Optional[bool] = Query(None, description="Use LLM understanding pass"),
+    naturalChunking: Optional[bool] = Query(None, description="Use paragraph/sentence natural chunking"),
+    llmRestructure: Optional[bool] = Query(None, description="Use LLM to restructure document for clean topic separation"),
+    softMaxTokens: Optional[int] = Query(None, description="Soft token cap for natural chunks"),
+    hardMaxTokens: Optional[int] = Query(None, description="Hard token cap for natural chunks"),
+    stream: Optional[bool] = Query(False, description="Stream processing updates via SSE"),
+):
     safe_filename = safe_decode_filename(file.filename)
     
     # 1) Check for duplicates
@@ -191,15 +606,146 @@ async def process_document(companyId: str, file: UploadFile = File(...)):
         )
 
     try:
+        # Read file content once at the beginning
+        content = await file.read()
+        
+        # Prepare a generator for SSE if streaming is requested
+        async def _stream_generator():
+            try:
+                # 2) Save file locally first
+                yield _sse_format("status", {"step": "save_local", "message": "Saving uploaded file"})
+                upload_dir = os.path.join("uploads", companyId, "temp")
+                os.makedirs(upload_dir, exist_ok=True)
+                temp_path = os.path.join(upload_dir, safe_filename)
+                with open(temp_path, "wb") as f:
+                    f.write(content)
+
+                # 3) Upload to GCS
+                yield _sse_format("status", {"step": "upload_gcs", "message": "Uploading to GCS"})
+                gcs_url = upload_to_gcs(
+                    content=content,
+                    company_id=companyId,
+                    folder="documents",
+                    filename=safe_filename,
+                    content_type=file.content_type or "application/octet-stream"
+                )
+
+                # 4) Process with Docling
+                yield _sse_format("status", {"step": "docling_convert", "message": "Converting with Docling"})
+                result = converter.convert(source=temp_path)
+                document = result.document
+                markdown_output = document.export_to_markdown()
+                yield _sse_format("debug", {"markdown_preview": markdown_output[:500]})
+
+                # Resolve flags
+                use_llm = llmEnrich if llmEnrich is not None else RAG_USE_LLM_UNDERSTAND_DEFAULT
+                use_natural = naturalChunking if naturalChunking is not None else RAG_NATURAL_CHUNKING_DEFAULT
+                use_restructure = llmRestructure if llmRestructure is not None else RAG_LLM_RESTRUCTURE_DEFAULT
+                soft_cap = int(softMaxTokens) if softMaxTokens else RAG_SOFT_MAX_TOKENS
+                hard_cap = int(hardMaxTokens) if hardMaxTokens else RAG_HARD_MAX_TOKENS
+
+                # Optional LLM document restructuring for clean topic separation
+                final_markdown = markdown_output
+                if use_restructure:
+                    yield _sse_format("status", {"step": "llm_restructure", "message": "Restructuring document with LLM for clean topic separation"})
+                    final_markdown = _llm_restructure_document(markdown_output)
+                    yield _sse_format("debug", {"restructured_preview": final_markdown[:500]})
+
+                # Extract sections
+                yield _sse_format("status", {"step": "extract_sections", "message": "Extracting sections from markdown"})
+                sections = _extract_sections_from_markdown(final_markdown)
+                yield _sse_format("debug", {"sections_count": len(sections)})
+
+                # Optional LLM insights
+                insights = None
+                if use_llm:
+                    yield _sse_format("status", {"step": "llm_insights", "message": "Running LLM insights (best-effort)"})
+                    insights = _llm_understand_sections(sections)
+                    yield _sse_format("debug", {"insights_preview": insights.get("sections", [])[:2] if insights else None})
+
+                # Chunking
+                yield _sse_format("status", {"step": "chunking", "message": "Building chunks"})
+                chunks = None
+                if use_natural:
+                    try:
+                        chunks = _build_natural_chunks(sections, soft_cap, hard_cap)
+                        yield _sse_format("debug", {"natural_chunks": len(chunks)})
+                    except Exception as nerr:
+                        yield _sse_format("warn", {"message": f"Natural chunking failed, fallback: {str(nerr)}"})
+                if chunks is None:
+                    chunker = HybridChunker(tokenizer=tokenizer, max_tokens=MAX_TOKENS, merge_peers=True)
+                    dl_chunks = list(chunker.chunk(dl_doc=document))
+                    chunks = dl_chunks
+                    yield _sse_format("debug", {"hybrid_chunks": len(dl_chunks)})
+
+                if not chunks:
+                    raise ValueError("No chunks were created from the document")
+
+                # Prepare chunks for storage and log each
+                yield _sse_format("status", {"step": "prepare", "message": "Preparing chunks for storage"})
+                to_store = []
+                if use_natural and isinstance(chunks, list) and chunks and isinstance(chunks[0], dict):
+                    for i, ch in enumerate(chunks):
+                        item = {
+                            "text": ch.get("text", ""),
+                            "metadata": {
+                                "filename": safe_filename,
+                                "page_numbers": None,
+                                "title": ch.get("section_title"),
+                                "url": gcs_url,
+                            },
+                        }
+                        to_store.append(item)
+                        yield _sse_format("chunk", {"index": i, "title": item["metadata"]["title"], "preview": item["text"][:160]})
+                else:
+                    for i, chunk in enumerate(chunks):
+                        page_nums = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}) or []
+                        page_nums_str = json.dumps(page_nums) if page_nums else None
+                        item = {
+                            "text": chunk.text,
+                            "metadata": {
+                                "filename": safe_filename,
+                                "page_numbers": page_nums_str,
+                                "title": chunk.meta.headings[0] if chunk.meta.headings else None,
+                                "url": gcs_url,
+                            },
+                        }
+                        to_store.append(item)
+                        yield _sse_format("chunk", {"index": i, "title": item["metadata"]["title"], "preview": item["text"][:160], "pages": page_nums})
+
+                if not to_store:
+                    raise ValueError("No chunks were prepared for storage")
+
+                # Store
+                yield _sse_format("status", {"step": "store", "message": f"Storing {len(to_store)} chunks"})
+                table.add(to_store)
+                yield _sse_format("done", {
+                    "message": "Document processed and embeddings stored successfully.",
+                    "row_count": table.count_rows(),
+                    "url": gcs_url,
+                    "natural": bool(use_natural),
+                    "llm": bool(use_llm),
+                    "restructured": bool(use_restructure),
+                })
+            except Exception as e:
+                yield _sse_format("error", {"message": str(e)})
+            finally:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+        if stream:
+            return StreamingResponse(_stream_generator(), media_type="text/event-stream")
+
+        # Non-streaming path (existing behavior with extra per-chunk logging)
         # 2) Save file locally first
         upload_dir = os.path.join("uploads", companyId, "temp")
         os.makedirs(upload_dir, exist_ok=True)
         temp_path = os.path.join(upload_dir, safe_filename)
-        
-        content = await file.read()
         with open(temp_path, "wb") as f:
             f.write(content)
-        
+
         # 3) Upload to GCS
         gcs_url = upload_to_gcs(
             content=content,
@@ -210,121 +756,109 @@ async def process_document(companyId: str, file: UploadFile = File(...)):
         )
 
         # 4) Process with Docling
-        try:
-            result = converter.convert(source=temp_path)
-            document = result.document
-            
-            # Optional: Export markdown for debugging
-            markdown_output = document.export_to_markdown()
-            print("Markdown output:", markdown_output)
+        result = converter.convert(source=temp_path)
+        document = result.document
+        markdown_output = document.export_to_markdown()
 
-            # 5) Create chunks
+        # Resolve flags
+        use_llm = llmEnrich if llmEnrich is not None else RAG_USE_LLM_UNDERSTAND_DEFAULT
+        use_natural = naturalChunking if naturalChunking is not None else RAG_NATURAL_CHUNKING_DEFAULT
+        use_restructure = llmRestructure if llmRestructure is not None else RAG_LLM_RESTRUCTURE_DEFAULT
+        soft_cap = int(softMaxTokens) if softMaxTokens else RAG_SOFT_MAX_TOKENS
+        hard_cap = int(hardMaxTokens) if hardMaxTokens else RAG_HARD_MAX_TOKENS
+
+        # Optional LLM document restructuring for clean topic separation
+        final_markdown = markdown_output
+        if use_restructure:
+            final_markdown = _llm_restructure_document(markdown_output)
+
+        # Extract sections
+        sections = _extract_sections_from_markdown(final_markdown)
+
+        # Optional LLM understanding
+        insights = _llm_understand_sections(sections) if use_llm else None
+
+        # Chunking
+        chunks = None
+        if use_natural:
             try:
-                print("Starting chunking process...")
-                chunker = HybridChunker(
-                    tokenizer=tokenizer,
-                    max_tokens=MAX_TOKENS,
-                    merge_peers=True
-                )
-                print("Created chunker successfully")
-                
-                try:
-                    chunks = list(chunker.chunk(dl_doc=document))
-                    print(f"Created {len(chunks)} chunks from document")
-                except Exception as chunk_error:
-                    print(f"Error during chunking: {str(chunk_error)}")
-                    import traceback
-                    print(f"Chunking traceback: {traceback.format_exc()}")
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Error during chunking: {str(chunk_error)}\nTraceback: {traceback.format_exc()}"
-                    )
-                
-                if not chunks:
-                    raise ValueError("No chunks were created from the document")
+                chunks = _build_natural_chunks(sections, soft_cap, hard_cap)
+            except Exception as nerr:
+                print(f"Natural chunking failed, fallback: {nerr}")
+        if chunks is None:
+            chunker = HybridChunker(tokenizer=tokenizer, max_tokens=MAX_TOKENS, merge_peers=True)
+            chunks = list(chunker.chunk(dl_doc=document))
 
-                # 6) Prepare chunks for storage
-                to_store = []
-                for i, chunk in enumerate(chunks):
-                    try:
-                        page_nums = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}) or []
-                        # Convert page numbers to JSON string
-                        page_nums_str = json.dumps(page_nums) if page_nums else None
-                        
-                        to_store.append({
-                            "text": chunk.text,
-                            "metadata": {
-                                "filename": safe_filename,
-                                "page_numbers": page_nums_str,  # Store as JSON string
-                                "title": chunk.meta.headings[0] if chunk.meta.headings else None,
-                                "url": gcs_url,
-                            },
-                        })
-                        print(f"Processed chunk {i+1}/{len(chunks)}")
-                    except Exception as chunk_error:
-                        print(f"Error processing chunk {i+1}: {str(chunk_error)}")
-                        import traceback
-                        print(f"Chunk processing traceback: {traceback.format_exc()}")
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"Error processing chunk {i+1}: {str(chunk_error)}\nTraceback: {traceback.format_exc()}"
-                        )
-                if not to_store:
-                    raise ValueError("No chunks were prepared for storage")
-                print(f"Preparing to store {len(to_store)} chunks. First few items:")
-                for i, item_to_store in enumerate(to_store[:3]): # Print first 3 items
-                    print(f"Item {i}:")
-                    print(f"  Text: {item_to_store['text'][:50]}...") # First 50 chars
-                    print(f"  Metadata: {item_to_store['metadata']}")
-                    # Specifically check page_numbers type and value
-                    page_numbers_val = item_to_store['metadata'].get('page_numbers')
-                    print(f"  Metadata.page_numbers: {page_numbers_val} (type: {type(page_numbers_val)})")
+        if not chunks:
+            raise ValueError("No chunks were created from the document")
 
-                # 7) Store in LanceDB
-                try:
-                    table.add(to_store)
-                    print(f"Added {len(to_store)} chunks to LanceDB")
-                except Exception as storage_error:
-                    print(f"Error storing chunks in LanceDB: {str(storage_error)}")
-                    import traceback
-                    print(f"Storage traceback: {traceback.format_exc()}")
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Error storing chunks in LanceDB: {str(storage_error)}\nTraceback: {traceback.format_exc()}"
-                    )
-
-                return {
-                    "message": "Document processed and embeddings stored successfully.",
-                    "row_count": table.count_rows(),
-                    "url": gcs_url
+        # Prepare chunks for storage with logging
+        to_store = []
+        if use_natural and isinstance(chunks, list) and chunks and isinstance(chunks[0], dict):
+            for i, ch in enumerate(chunks):
+                item = {
+                    "text": ch.get("text", ""),
+                    "metadata": {
+                        "filename": safe_filename,
+                        "page_numbers": None,
+                        "title": ch.get("section_title"),
+                        "url": gcs_url,
+                    },
                 }
+                to_store.append(item)
+                print({"chunk_index": i, "title": item["metadata"]["title"], "preview": item["text"][:160]})
+        else:
+            for i, chunk in enumerate(chunks):
+                page_nums = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}) or []
+                page_nums_str = json.dumps(page_nums) if page_nums else None
+                item = {
+                    "text": chunk.text,
+                    "metadata": {
+                        "filename": safe_filename,
+                        "page_numbers": page_nums_str,
+                        "title": chunk.meta.headings[0] if chunk.meta.headings else None,
+                        "url": gcs_url,
+                    },
+                }
+                to_store.append(item)
+                print({"chunk_index": i, "title": item["metadata"]["title"], "preview": item["text"][:160], "pages": page_nums})
 
-            except Exception as chunking_error:
-                print(f"Chunking error: {str(chunking_error)}")
-                import traceback
-                print(f"Full traceback: {traceback.format_exc()}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Error during document chunking: {str(chunking_error)}\nTraceback: {traceback.format_exc()}"
-                )
+        if not to_store:
+            raise ValueError("No chunks were prepared for storage")
 
-        except Exception as e:
-            print(f"Document processing error: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
-        finally:
-            # Clean up temp file
-            try:
+        table.add(to_store)
+        response_obj = {
+            "message": "Document processed and embeddings stored successfully.",
+            "row_count": table.count_rows(),
+            "url": gcs_url,
+            "natural": bool(use_natural),
+            "llm": bool(use_llm),
+            "restructured": bool(use_restructure),
+        }
+        if use_llm and insights:
+            response_obj["insights_preview"] = insights.get("sections", [])[:2]
+        return response_obj
+        
+    except Exception as e:
+        print(f"Document processing error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
+    finally:
+        # Clean up temp file
+        try:
+            if 'temp_path' in locals():
                 os.remove(temp_path)
                 print(f"Cleaned up temporary file: {temp_path}")
-            except Exception as cleanup_error:
-                print(f"Warning: Failed to clean up temporary file: {cleanup_error}")
-
-    except Exception as e:
-        print(f"General error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+        except Exception as cleanup_error:
+            print(f"Warning: Failed to clean up temporary file: {cleanup_error}")
 
 @app.get("/companies/{companyId}/search")
-async def search_documents(companyId: str, query: str = Query(...), limit: int = Query(5)):
+async def search_documents(
+    companyId: str, 
+    query: str = Query(...), 
+    limit: int = Query(5),
+    useReranker: bool = Query(True, description="Use OpenAI GPT-4o-mini reranker for better results"),
+    rerankTopK: Optional[int] = Query(None, description="Number of docs to retrieve before reranking")
+):
     """
     Search through company documents using semantic search.
     Returns matching chunks with their metadata and relevance scores.
@@ -338,28 +872,61 @@ async def search_documents(companyId: str, query: str = Query(...), limit: int =
     )
     query_vec = emb_resp.data[0].embedding
 
-    # 2) Search using the vector
+    # 2) Determine search limits
+    rerank_enabled = useReranker and OPENAI_RERANKER_ENABLED
+    search_limit = rerankTopK or (OPENAI_RERANKER_TOP_K if rerank_enabled else limit)
+    
+    # 3) Search using the vector (get more results if reranking)
     try:
-        df = table.search(query_vec).limit(limit).to_pandas()
+        df = table.search(query_vec).limit(search_limit).to_pandas()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search error: {e}")
 
-    # 3) Format results
-    results = []
+    # 4) Format initial results
+    initial_results = []
     for _, r in df.iterrows():
         md = r["metadata"]
         # Parse page numbers from JSON string if present
         page_numbers = json.loads(md["page_numbers"]) if md["page_numbers"] else None
         
-        results.append({
+        initial_results.append({
             "text":         r["text"],
             "filename":     md["filename"],
-            "page_numbers": page_numbers,  # Now properly parsed from JSON
+            "page_numbers": page_numbers,
             "title":        md["title"],
             "url":          md["url"],
-            "score":        float(r.get("_distance", 0))  # Add relevance score
+            "score":        float(r.get("_distance", 0))  # Vector similarity score
         })
-    return {"results": results}
+    
+    # 5) Apply Jina reranking if enabled
+    final_results = initial_results
+    rerank_metadata = {"reranked": False}
+    
+    if rerank_enabled and len(initial_results) > 1:
+        import time
+        start_time = time.time()
+        
+        try:
+            reranked_results = _openai_rerank(query, initial_results, top_k=limit)
+            if reranked_results:
+                final_results = reranked_results
+                rerank_metadata = {
+                    "reranked": True,
+                    "reranker_model": OPENAI_RERANKER_MODEL,
+                    "original_count": len(initial_results),
+                    "reranked_count": len(final_results),
+                    "rerank_time_ms": int((time.time() - start_time) * 1000)
+                }
+        except Exception as rerank_error:
+            print(f"Reranking failed, using vector results: {rerank_error}")
+            final_results = initial_results[:limit]
+    else:
+        final_results = initial_results[:limit]
+    
+    return {
+        "results": final_results,
+        **rerank_metadata
+    }
 
 @app.delete("/companies/{companyId}/delete-document")
 async def delete_document(companyId: str, filename: str = Query(...)):
