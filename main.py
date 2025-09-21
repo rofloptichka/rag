@@ -7,7 +7,7 @@ import hashlib
 import urllib.parse
 from pydantic import BaseModel
 
-from fastapi import FastAPI, Form, UploadFile, File, Query, HTTPException
+from fastapi import FastAPI, Form, UploadFile, File, Query, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from dotenv import load_dotenv
 
@@ -15,20 +15,21 @@ import cloudinary
 import cloudinary.uploader
 import cloudinary.api
 
-import lancedb
-from lancedb.embeddings import get_registry
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
 from docling.document_converter import DocumentConverter
 from docling.chunking import HybridChunker
 
 from openai import OpenAI
 from utils.tokenizer import OpenAITokenizerWrapper
+from utils.reranker import rerank_with_openai, rerank_with_jina
 
 from google.oauth2 import service_account
 from google.cloud import storage
 
 from typing import List, Optional, Dict, Any, Tuple
-import pyarrow as pa
-from lancedb.pydantic import LanceModel, Vector
+import time
+import logging
 
 load_dotenv()
 
@@ -40,6 +41,10 @@ tokenizer = OpenAITokenizerWrapper()
 MAX_TOKENS = 512
 converter = DocumentConverter()
 
+# OpenAI embedding configuration
+EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")
+EMBED_DIMS = int(os.getenv("OPENAI_EMBED_DIMS", "3072"))
+
 b64_key = os.environ["GOOGLE_CLOUD_KEY"]
 decoded = base64.b64decode(b64_key)
 sa_info = json.loads(decoded)
@@ -47,9 +52,15 @@ creds = service_account.Credentials.from_service_account_info(sa_info)
 storage_client = storage.Client(credentials=creds, project=sa_info["project_id"])
 bucket = storage_client.bucket(os.environ["GCS_BUCKET_NAME"])
 
-# Подключаемся к LanceDB (папка "data/lancedb" должна существовать или будет создана)
-db = lancedb.connect("data/lancedb")
-func = get_registry().get("openai").create(name="text-embedding-3-large")
+# --- Qdrant ---
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+qdrant: QdrantClient = QdrantClient(
+    url=QDRANT_URL, 
+    api_key=QDRANT_API_KEY,
+    prefer_grpc=False,
+    timeout=60
+)
 
 app = FastAPI()
 
@@ -59,6 +70,21 @@ cloudinary.config(
   api_secret = os.getenv("CLOUDINARY_API_SECRET"),
   secure=True # Recommended to use HTTPS
 )
+
+# ------------------------------------------------------------------------------
+# Request timing middleware
+# ------------------------------------------------------------------------------
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    process_time_ms = (time.perf_counter() - start_time) * 1000.0
+    response.headers["X-Process-Time-ms"] = f"{process_time_ms:.2f}"
+    response.headers["Server-Timing"] = f"app;dur={process_time_ms:.2f}"
+    logging.getLogger("uvicorn.error").info(
+        f"{request.method} {request.url.path} completed in {process_time_ms:.2f} ms"
+    )
+    return response
 
 # ------------------------------------------------------------------------------
 # Feature flags and config (env-driven)
@@ -77,9 +103,16 @@ LLM_SUM_MODEL                  = os.getenv("LLM_SUM_MODEL", "gpt-4.1-mini")
 
 # OpenAI reranker configuration
 OPENAI_RERANKER_ENABLED        = _parse_bool_env(os.getenv("OPENAI_RERANKER_ENABLED"), False)
-OPENAI_RERANKER_MODEL          = os.getenv("OPENAI_RERANKER_MODEL", "gpt-4o-mini")
+OPENAI_RERANKER_MODEL          = os.getenv("OPENAI_RERANKER_MODEL", "gpt-4.1-nano")
 OPENAI_RERANKER_TOP_K          = int(os.getenv("OPENAI_RERANKER_TOP_K", "20"))
 OPENAI_RERANKER_TIMEOUT        = int(os.getenv("OPENAI_RERANKER_TIMEOUT", "15"))
+
+# Jina reranker configuration
+JINA_RERANKER_ENABLED          = _parse_bool_env(os.getenv("JINA_RERANKER_ENABLED"), False)
+JINA_API_KEY                   = os.getenv("JINA_API_KEY")
+JINA_RERANKER_MODEL            = os.getenv("JINA_RERANKER_MODEL", "jina-reranker-v2-base-multilingual")
+JINA_RERANKER_ENDPOINT         = os.getenv("JINA_RERANKER_ENDPOINT", "https://api.jina.ai/v1/rerank")
+JINA_RERANKER_TIMEOUT          = int(os.getenv("JINA_RERANKER_TIMEOUT", "15"))
 
 # ------------------------------------------------------------------------------
 # Sentence splitting utilities (blingfire if available, regex fallback)
@@ -125,81 +158,7 @@ def _sse_format(event: str, data: Any) -> str:
         payload = json.dumps({"message": str(data)})
     return f"event: {event}\ndata: {payload}\n\n"
 
-# ------------------------------------------------------------------------------
-# OpenAI reranker service
-# ------------------------------------------------------------------------------
-def _openai_rerank(query: str, documents: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, Any]]:
-    """
-    Rerank documents using OpenAI GPT-4o-mini for relevance scoring.
-    Returns reranked documents with updated scores.
-    """
-    if not OPENAI_RERANKER_ENABLED or len(documents) <= 1:
-        return documents[:top_k]
-    
-    try:
-        # Prepare documents for OpenAI with numbering
-        doc_list = []
-        for i, doc in enumerate(documents):
-            text_preview = doc.get("text", "")[:300]  # Limit to 300 chars
-            title = doc.get("title", "Без названия")
-            filename = doc.get("filename", "")
-            
-            doc_summary = f"[{i}] Раздел: {title}\nФайл: {filename}\nТекст: {text_preview}..."
-            doc_list.append(doc_summary)
-        
-        # Create reranking prompt
-        docs_text = "\n\n".join(doc_list)
-        
-        prompt = f"""Вы - эксперт по поиску в медицинской базе знаний. Оцените релевантность каждого документа к запросу пользователя.
-
-ЗАПРОС: "{query}"
-
-ДОКУМЕНТЫ:
-{docs_text}
-
-Верните JSON со списком индексов документов, отсортированных по релевантности (от самого релевантного к менее релевантному). Включите только {min(top_k, len(documents))} самых релевантных документов.
-
-Формат ответа:
-{{"rankings": [
-    {{"index": 0, "relevance_score": 0.95, "reason": "краткое объяснение"}},
-    {{"index": 2, "relevance_score": 0.87, "reason": "краткое объяснение"}}
-]}}"""
-
-        response = client.chat.completions.create(
-            model=OPENAI_RERANKER_MODEL,
-            messages=[
-                {"role": "system", "content": "Вы эксперт по медицинской информации. Оцените релевантность документов точно и объективно."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-            response_format={"type": "json_object"},
-            timeout=OPENAI_RERANKER_TIMEOUT
-        )
-        
-        result_text = response.choices[0].message.content
-        result = json.loads(result_text)
-        
-        reranked_docs = []
-        for ranking in result.get("rankings", []):
-            doc_idx = ranking.get("index")
-            relevance_score = ranking.get("relevance_score", 0.0)
-            reason = ranking.get("reason", "")
-            
-            if 0 <= doc_idx < len(documents):
-                reranked_doc = documents[doc_idx].copy()
-                reranked_doc["rerank_score"] = relevance_score
-                reranked_doc["rerank_reason"] = reason
-                # Keep original vector score for comparison
-                reranked_doc["vector_score"] = reranked_doc.get("score", 0.0)
-                reranked_doc["score"] = relevance_score  # Use rerank score as primary
-                reranked_docs.append(reranked_doc)
-        
-        print(f"OpenAI reranked {len(documents)} -> {len(reranked_docs)} documents")
-        return reranked_docs[:top_k]
-        
-    except Exception as e:
-        print(f"OpenAI reranker error: {str(e)}")
-        return documents[:top_k]
+## Reranker moved to utils/reranker.py
 
 # ------------------------------------------------------------------------------
 # Markdown-based section/paragraph extraction
@@ -467,71 +426,80 @@ def _llm_understand_sections(sections: List[Dict[str, Any]], max_sections: int =
     return insights
 
 # ------------------------------------------------------------------------------
-# Pydantic-схемы для таблиц
+# Qdrant helper functions
 # ------------------------------------------------------------------------------
-class ChunkMetadata(LanceModel):
-    filename: Optional[str] = None
-    page_numbers: Optional[str] = None  # Store as JSON string instead of List[int]
-    title: Optional[str] = None
-    url: str
 
-class Chunks(LanceModel):
-    text: str = func.SourceField()
-    vector: Vector(func.ndims()) = func.VectorField()  # type: ignore
-    metadata: ChunkMetadata
+def company_doc_collection(company_id: str) -> str:
+    return f"docling_{company_id}"
 
+def company_sendable_collection(company_id: str) -> str:
+    return f"sendable_files_{company_id}"
+
+def ensure_collection(name: str):
+    """Create Qdrant collection if missing with HNSW index tuned for latency."""
+    try:
+        qdrant.get_collection(name)
+        return
+    except Exception:
+        pass
+
+    qdrant.recreate_collection(
+        collection_name=name,
+        vectors_config=qmodels.VectorParams(
+            size=EMBED_DIMS,
+            distance=qmodels.Distance.COSINE,
+        ),
+        hnsw_config=qmodels.HnswConfigDiff(m=32, ef_construct=256),
+        optimizers_config=qmodels.OptimizersConfigDiff(
+            default_segment_number=2,
+        ),
+        replication_factor=int(os.getenv("QDRANT_RF", "1")),
+    )
+    # Helpful payload indexes
+    for key, field_type in [
+        ("metadata.filename", qmodels.PayloadSchemaType.KEYWORD),
+        ("metadata.index", qmodels.PayloadSchemaType.KEYWORD),
+        ("metadata.title", qmodels.PayloadSchemaType.KEYWORD),
+    ]:
+        try:
+            qdrant.create_payload_index(
+                collection_name=name,
+                field_name=key,
+                field_schema=field_type,
+            )
+        except Exception:
+            pass
+
+def sha_id(*parts: str) -> int:
+    """Deterministic numeric ID for Qdrant (64-bit slice of SHA-256)."""
+    h = hashlib.sha256("::".join(parts).encode("utf-8")).hexdigest()
+    return int(h[:16], 16)
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    # Batch embeddings to reduce overhead; OpenAI supports batching via list input
+    resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [d.embedding for d in resp.data]
+
+# ------------------------------------------------------------------------------
+# Pydantic models for request bodies
+# ------------------------------------------------------------------------------
 class UpdateSendableDescription(BaseModel):
     new_description: str
-
-# Alternative approach - use a separate field for page numbers
-class ChunkMetadataAlt(LanceModel):
-    filename: Optional[str] = None
-    title: Optional[str] = None
-    url: str
-
-class ChunksAlt(LanceModel):
-    text: str = func.SourceField()
-    vector: Vector(func.ndims()) = func.VectorField()  # type: ignore
-    metadata: ChunkMetadataAlt
-    page_numbers: Optional[str] = None 
-
-class SendableMetadata(LanceModel):
-    index: Optional[str] = None 
-    file_type: str | None
-    filename: str | None
-    url: str | None # GCS URL
-    cloudinary_url: Optional[str] = None
-    cloudinary_public_id: Optional[str] = None
-
-class SendableFile(LanceModel):
-    text: str = func.SourceField()
-    vector: Vector(func.ndims()) = func.VectorField()  # type: ignore
-    metadata: Optional[SendableMetadata] = None
 
 # ------------------------------------------------------------------------------
 # Хелпер-функции
 # ------------------------------------------------------------------------------
 def get_company_doc_table(company_id: str):
-    """Returns or creates a table for the company's documents."""
-    table_name = f"docling_{company_id}"
-    try:
-        table = db.open_table(table_name)
-        print(f"Opened existing table '{table_name}'.")
-    except ValueError:
-        table = db.create_table(table_name, schema=Chunks, mode="create")
-        print(f"Created new table '{table_name}'.")
-    return table
+    """Returns the collection name for the company's documents."""
+    collection = company_doc_collection(company_id)
+    ensure_collection(collection)
+    return collection
 
 def get_company_sendable_table(company_id: str):
-    """Returns or creates a table for the company's sendable files."""
-    table_name = f"sendable_files_{company_id}"
-    try:
-        table = db.open_table(table_name)
-        print(f"Opened existing table '{table_name}'.")
-    except ValueError:
-        table = db.create_table(table_name, schema=SendableFile, mode="create")
-        print(f"Created new table '{table_name}'.")
-    return table
+    """Returns the collection name for the company's sendable files."""
+    collection = company_sendable_collection(company_id)
+    ensure_collection(collection)
+    return collection
 
 def safe_decode_filename(filename: str) -> str:
     """Fixes improperly decoded filenames."""
@@ -551,29 +519,29 @@ def upload_to_gcs(content: bytes, company_id: str, folder: str, filename: str, c
     blob.upload_from_string(content, content_type=content_type)
     return f"gs://{bucket.name}/{path}"
 
-@app.delete("/{companyId}/fuckdrop") # для удаления всех таблиц компании
+@app.delete("/{companyId}/fuckdrop") # для удаления всех коллекций компании
 def clear_company_tables(companyId: str):
-    """Clear existing tables for a company to fix schema issues."""
-    doc_table_name = f"docling_{companyId}"
-    sendable_table_name = f"sendable_files_{companyId}"
+    """Clear existing collections for a company to fix schema issues."""
+    doc_collection = company_doc_collection(companyId)
+    sendable_collection = company_sendable_collection(companyId)
     
     try:
-        # Delete document table if it exists
+        # Delete document collection if it exists
         try:
-            db.drop_table(doc_table_name)
-            print(f"Dropped table '{doc_table_name}'")
-        except ValueError:
-            print(f"Table '{doc_table_name}' doesn't exist")
+            qdrant.delete_collection(doc_collection)
+            print(f"Dropped collection '{doc_collection}'")
+        except Exception:
+            print(f"Collection '{doc_collection}' doesn't exist")
             
-        # Delete sendable files table if it exists
+        # Delete sendable files collection if it exists
         try:
-            db.drop_table(sendable_table_name)
-            print(f"Dropped table '{sendable_table_name}'")
-        except ValueError:
-            print(f"Table '{sendable_table_name}' doesn't exist")
+            qdrant.delete_collection(sendable_collection)
+            print(f"Dropped collection '{sendable_collection}'")
+        except Exception:
+            print(f"Collection '{sendable_collection}' doesn't exist")
             
     except Exception as e:
-        print(f"Error clearing tables: {str(e)}")
+        print(f"Error clearing collections: {str(e)}")
 
 # ------------------------------------------------------------------------------
 # Document Processing Endpoint
@@ -593,12 +561,10 @@ async def process_document(
     
     # 1) Check for duplicates
     table = get_company_doc_table(companyId)
-    df = table.to_pandas()
-    dup_count = int(
-        df["metadata"]
-          .apply(lambda md: md.get("filename") == safe_filename)
-          .sum()
+    filter_q = qmodels.Filter(
+        must=[qmodels.FieldCondition(key="metadata.filename", match=qmodels.MatchValue(value=safe_filename))]
     )
+    dup_count = qdrant.count(collection_name=table, count_filter=filter_q, exact=True).count
     if dup_count > 0:
         raise HTTPException(
             status_code=400,
@@ -716,12 +682,34 @@ async def process_document(
                 if not to_store:
                     raise ValueError("No chunks were prepared for storage")
 
-                # Store
+                # Store in Qdrant
                 yield _sse_format("status", {"step": "store", "message": f"Storing {len(to_store)} chunks"})
-                table.add(to_store)
+                
+                # Convert to Qdrant format
+                # Include section title in the text we embed so titles influence search
+                embed_inputs = []
+                for item in to_store:
+                    title = (item.get("metadata") or {}).get("title")
+                    if title:
+                        embed_inputs.append(f"Title: {title}\n\n{item['text']}")
+                    else:
+                        embed_inputs.append(item["text"])
+                vectors = embed_texts(embed_inputs)
+                points = []
+                for i, (item, vector) in enumerate(zip(to_store, vectors)):
+                    point_id = sha_id(companyId, safe_filename, str(i))
+                    payload = {
+                        "text": item["text"],
+                        "metadata": item["metadata"]
+                    }
+                    points.append(qmodels.PointStruct(id=point_id, vector=vector, payload=payload))
+                
+                qdrant.upsert(collection_name=table, wait=True, points=points)
+                total_count = qdrant.count(collection_name=table, exact=False).count
+                
                 yield _sse_format("done", {
                     "message": "Document processed and embeddings stored successfully.",
-                    "row_count": table.count_rows(),
+                    "row_count": int(total_count),
                     "url": gcs_url,
                     "natural": bool(use_natural),
                     "llm": bool(use_llm),
@@ -826,10 +814,31 @@ async def process_document(
         if not to_store:
             raise ValueError("No chunks were prepared for storage")
 
-        table.add(to_store)
+        # Convert to Qdrant format and store
+        # Include section title in the text we embed so titles influence search
+        embed_inputs = []
+        for item in to_store:
+            title = (item.get("metadata") or {}).get("title")
+            if title:
+                embed_inputs.append(f"Title: {title}\n\n{item['text']}")
+            else:
+                embed_inputs.append(item["text"])
+        vectors = embed_texts(embed_inputs)
+        points = []
+        for i, (item, vector) in enumerate(zip(to_store, vectors)):
+            point_id = sha_id(companyId, safe_filename, str(i))
+            payload = {
+                "text": item["text"],
+                "metadata": item["metadata"]
+            }
+            points.append(qmodels.PointStruct(id=point_id, vector=vector, payload=payload))
+        
+        qdrant.upsert(collection_name=table, wait=True, points=points)
+        total_count = qdrant.count(collection_name=table, exact=False).count
+        
         response_obj = {
             "message": "Document processed and embeddings stored successfully.",
-            "row_count": table.count_rows(),
+            "row_count": int(total_count),
             "url": gcs_url,
             "natural": bool(use_natural),
             "llm": bool(use_llm),
@@ -856,8 +865,9 @@ async def search_documents(
     companyId: str, 
     query: str = Query(...), 
     limit: int = Query(5),
-    useReranker: bool = Query(True, description="Use OpenAI GPT-4o-mini reranker for better results"),
-    rerankTopK: Optional[int] = Query(None, description="Number of docs to retrieve before reranking")
+    useReranker: bool = Query(True, description="Use reranker for better results"),
+    rerankTopK: Optional[int] = Query(None, description="Number of docs to retrieve before reranking"),
+    rerankerProvider: Optional[str] = Query(None, description="'openai' or 'jina' (overrides env flags)"),
 ):
     """
     Search through company documents using semantic search.
@@ -872,33 +882,63 @@ async def search_documents(
     )
     query_vec = emb_resp.data[0].embedding
 
-    # 2) Determine search limits
-    rerank_enabled = useReranker and OPENAI_RERANKER_ENABLED
+    # 2) Determine reranker provider and search limits
+    provider = (rerankerProvider or "").strip().lower() if rerankerProvider else None
+    use_openai = False
+    use_jina = False
+    if useReranker:
+        if provider == "openai":
+            use_openai = OPENAI_RERANKER_ENABLED
+        elif provider == "jina":
+            use_jina = JINA_RERANKER_ENABLED and bool(JINA_API_KEY)
+        else:
+            # Default preference: OpenAI if enabled; otherwise Jina if enabled
+            if OPENAI_RERANKER_ENABLED:
+                use_openai = True
+            elif JINA_RERANKER_ENABLED and bool(JINA_API_KEY):
+                use_jina = True
+
+    rerank_enabled = use_openai or use_jina
     search_limit = rerankTopK or (OPENAI_RERANKER_TOP_K if rerank_enabled else limit)
     
-    # 3) Search using the vector (get more results if reranking)
+    # 3) Search using Qdrant (get more results if reranking)
     try:
-        df = table.search(query_vec).limit(search_limit).to_pandas()
+        hits = qdrant.search(
+            collection_name=table,
+            query_vector=query_vec,
+            limit=search_limit,
+            with_payload=True,
+            score_threshold=None,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search error: {e}")
 
     # 4) Format initial results
     initial_results = []
-    for _, r in df.iterrows():
-        md = r["metadata"]
-        # Parse page numbers from JSON string if present
-        page_numbers = json.loads(md["page_numbers"]) if md["page_numbers"] else None
-        
+    for hit in hits:
+        pl = hit.payload or {}
+        md = pl.get("metadata", {})
+        # Parse page numbers safely (stringified JSON, list, or None)
+        pn_raw = md.get("page_numbers")
+        page_numbers = None
+        if isinstance(pn_raw, str):
+            try:
+                page_numbers = json.loads(pn_raw)
+            except Exception:
+                page_numbers = None
+        elif isinstance(pn_raw, list):
+            page_numbers = pn_raw
+
         initial_results.append({
-            "text":         r["text"],
-            "filename":     md["filename"],
+            "text":         pl.get("text"),
+            "filename":     md.get("filename"),
             "page_numbers": page_numbers,
-            "title":        md["title"],
-            "url":          md["url"],
-            "score":        float(r.get("_distance", 0))  # Vector similarity score
+            "title":        md.get("title"),
+            "url":          md.get("url"),
+            "score":        float(hit.score) if hit.score is not None else 0.0  # Vector similarity score
         })
     
-    # 5) Apply Jina reranking if enabled
+    # 5) Apply reranking if enabled
     final_results = initial_results
     rerank_metadata = {"reranked": False}
     
@@ -907,16 +947,43 @@ async def search_documents(
         start_time = time.time()
         
         try:
-            reranked_results = _openai_rerank(query, initial_results, top_k=limit)
-            if reranked_results:
-                final_results = reranked_results
+            if use_openai:
+                reranked_results = rerank_with_openai(
+                    client=client,
+                    query=query,
+                    documents=initial_results,
+                    top_k=limit,
+                    enabled=True,
+                    model=OPENAI_RERANKER_MODEL,
+                    timeout=OPENAI_RERANKER_TIMEOUT,
+                )
                 rerank_metadata = {
                     "reranked": True,
                     "reranker_model": OPENAI_RERANKER_MODEL,
+                    "reranker_provider": "openai",
+                }
+            else:
+                reranked_results = rerank_with_jina(
+                    query=query,
+                    documents=initial_results,
+                    top_k=limit,
+                    api_key=JINA_API_KEY,
+                    model=JINA_RERANKER_MODEL,
+                    endpoint=JINA_RERANKER_ENDPOINT,
+                    timeout=JINA_RERANKER_TIMEOUT,
+                )
+                rerank_metadata = {
+                    "reranked": True,
+                    "reranker_model": JINA_RERANKER_MODEL,
+                    "reranker_provider": "jina",
+                }
+            if reranked_results:
+                final_results = reranked_results
+                rerank_metadata.update({
                     "original_count": len(initial_results),
                     "reranked_count": len(final_results),
                     "rerank_time_ms": int((time.time() - start_time) * 1000)
-                }
+                })
         except Exception as rerank_error:
             print(f"Reranking failed, using vector results: {rerank_error}")
             final_results = initial_results[:limit]
@@ -931,23 +998,23 @@ async def search_documents(
 @app.delete("/companies/{companyId}/delete-document")
 async def delete_document(companyId: str, filename: str = Query(...)):
     """
-    Delete a document and its chunks from both LanceDB and GCS.
+    Delete a document and its chunks from both Qdrant and GCS.
     The filename parameter should be just the filename, not a JSON object.
     """
     # 1) Get the table
     table = get_company_doc_table(companyId)
 
-    # 2) Count matching records
-    df = table.to_pandas()
-    deleted = int(
-        df["metadata"]
-          .apply(lambda md: md.get("filename") == filename)
-          .sum()
+    # 2) Count matching records and delete from Qdrant
+    filter_q = qmodels.Filter(
+        must=[qmodels.FieldCondition(key="metadata.filename", match=qmodels.MatchValue(value=filename))]
     )
+    
+    # Get count first
+    count_result = qdrant.count(collection_name=table, count_filter=filter_q, exact=True)
+    deleted = count_result.count
 
-    # 3) Delete from LanceDB
-    q = f"metadata.filename = '{filename}'"
-    table.delete(q)
+    # 3) Delete from Qdrant
+    qdrant.delete(collection_name=table, points_selector=qmodels.FilterSelector(filter=filter_q))
 
     # 4) Delete from GCS
     path = f"uploads/{companyId}/documents/{filename}"
@@ -958,7 +1025,7 @@ async def delete_document(companyId: str, filename: str = Query(...)):
         print(f"Warning: Failed to delete file from GCS: {str(e)}")
 
     return {
-        "message": f"Deleted {deleted} chunks from LanceDB and attempted to remove file from GCS.",
+        "message": f"Deleted {deleted} chunks from Qdrant and attempted to remove file from GCS.",
         "rows_deleted": deleted
     }
 
@@ -989,37 +1056,43 @@ async def process_sendable_file(
     safe_name = safe_decode_filename(file.filename)
     table     = get_company_sendable_table(companyId)
 
-    # 1) Check for duplicates and get existing data
-    df = table.to_pandas()
-    if df["metadata"].apply(lambda md: md.get("filename") == safe_name).any():
+    # 1) Check for duplicates
+    filter_q = qmodels.Filter(
+        must=[qmodels.FieldCondition(key="metadata.filename", match=qmodels.MatchValue(value=safe_name))]
+    )
+    dup_count = qdrant.count(collection_name=table, count_filter=filter_q, exact=True).count
+    if dup_count > 0:
         raise HTTPException(
             status_code=400,
             detail=f"Sendable '{safe_name}' already processed for company {companyId}"
         )
 
     ### NEW: Generate a unique, sequential index for the sendable ###
-    # 1.1) Calculate the next index
-    max_index = 0
-    if not df.empty:
-        # Extract numeric part from indices like 'SENDABLE-123'
-        # This is robust and handles cases where the index key might be missing
-        # or malformed in older records.
-        all_indices = []
-        for md in df["metadata"]:
-            index_str = md.get("index")
+    # 1.1) Calculate the next index by scanning existing indices
+    indices = []
+    cursor = None
+    while True:
+        batch, cursor = qdrant.scroll(
+            collection_name=table, 
+            with_payload=True, 
+            limit=1000, 
+            offset=cursor
+        )
+        for point in batch:
+            payload = point.payload or {}
+            metadata = payload.get("metadata", {})
+            index_str = metadata.get("index")
             if index_str and index_str.startswith("SF-"):
                 try:
-                    # Extract the number part and convert to integer
                     num = int(index_str.split('-')[1])
-                    all_indices.append(num)
+                    indices.append(num)
                 except (ValueError, IndexError):
-                    # Ignore malformed indices
                     pass
-        
-        if all_indices:
-            max_index = max(all_indices)
-
+        if cursor is None or not batch:
+            break
+    
     # The new index is the highest existing index + 1
+    max_index = max(indices) if indices else 0
     new_index_num = max_index + 1
     sendable_index = f"SF-{new_index_num}"
     ### END NEW ###
@@ -1060,31 +1133,30 @@ async def process_sendable_file(
     )
     embedding = emb_resp.data[0].embedding
 
-    # 4) Prepare record and save to LanceDB
-    ### MODIFIED ###
-    metadata_obj = SendableMetadata(
-        index=sendable_index,
-        file_type=(file.content_type or os.path.splitext(safe_name)[1]),
-        filename=safe_name,
-        url=gcs_url
-    )
-
-    if cloudinary_url:
-        metadata_obj.cloudinary_url = cloudinary_url
-        metadata_obj.cloudinary_public_id = cloudinary_public_id
-
-    # В запись передаем уже готовый, валидный объект
-    record = {
-        "text":    description,
-        "vector":  embedding,
-        "metadata": metadata_obj.model_dump() 
+    # 4) Prepare record and save to Qdrant
+    metadata = {
+        "index": sendable_index,
+        "file_type": (file.content_type or os.path.splitext(safe_name)[1]),
+        "filename": safe_name,
+        "url": gcs_url,
+        "cloudinary_url": cloudinary_url,
+        "cloudinary_public_id": cloudinary_public_id,
     }
-    table.add([record])
+
+    payload = {
+        "text": description,
+        "metadata": metadata
+    }
+    
+    point_id = sha_id(companyId, "sendable", safe_name)
+    point = qmodels.PointStruct(id=point_id, vector=embedding, payload=payload)
+    qdrant.upsert(collection_name=table, points=[point], wait=True)
 
     ### MODIFIED ###
+    total_count = qdrant.count(collection_name=table, exact=False).count
     return {
         "message":   "Sendable file processed and saved.",
-        "row_count": table.count_rows(),
+        "row_count": int(total_count),
         "index":     sendable_index, # Return the new index in the response
         "url": gcs_url,
         "cloudinary_url": cloudinary_url
@@ -1109,24 +1181,28 @@ async def update_sendable_description(
 
     new_description = data.new_description
 
-    # 1) Find the record to update
-    df = table.to_pandas()
-    rows_to_update = df[df["metadata"].apply(lambda md: md.get("filename") == safe_name)]
-
-    if len(rows_to_update) == 0:
+    # 1) Find the record to update using Qdrant
+    filter_q = qmodels.Filter(
+        must=[qmodels.FieldCondition(key="metadata.filename", match=qmodels.MatchValue(value=safe_name))]
+    )
+    found_records, _ = qdrant.scroll(
+        collection_name=table, 
+        scroll_filter=filter_q, 
+        with_payload=True, 
+        with_vectors=True,
+        limit=2
+    )
+    
+    if not found_records:
         raise HTTPException(
             status_code=404,
             detail=f"No sendable with filename '{safe_name}' found."
         )
-    elif len(rows_to_update) > 1:
-        # This should ideally never happen, but handle the edge case
+    elif len(found_records) > 1:
         raise HTTPException(
             status_code=500,
-            detail=f"Multiple sendables with filename '{safe_name}' found.  Data integrity issue."
+            detail=f"Multiple sendables with filename '{safe_name}' found. Data integrity issue."
         )
-
-    # Get the row's LanceDB internal ID to facilitate the update operation
-    record_id = rows_to_update.index[0]
 
     # 2) Recalculate embedding for the new description
     emb_resp = client.embeddings.create(
@@ -1135,22 +1211,15 @@ async def update_sendable_description(
     )
     new_embedding = emb_resp.data[0].embedding
 
-    # 3) Perform the update
-    try:
-        # Update the row in LanceDB. This only updates the text and vector.
-        table.update(
-            where=f"metadata.filename == '{safe_name}'",
-            values={"text": new_description, "vector": new_embedding} # Update both text and vector
-        )
+    # 3) Update with new description and vector
+    point = found_records[0]
+    payload = point.payload or {}
+    payload["text"] = new_description
+    
+    updated_point = qmodels.PointStruct(id=point.id, vector=new_embedding, payload=payload)
+    qdrant.upsert(collection_name=table, points=[updated_point], wait=True)
 
-        return {"message": f"Description for '{safe_name}' updated successfully."}
-
-    except Exception as e:
-        print(f"Update failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to update description: {e}"
-        )
+    return {"message": f"Description for '{safe_name}' updated successfully."}
 
 @app.get("/companies/{companyId}/search-sendable")
 async def search_sendable(
@@ -1167,20 +1236,27 @@ async def search_sendable(
     )
     query_vec = emb_resp.data[0].embedding
 
-    # 2) Ищем по вектору
-    df = table.search(query_vec).limit(limit).to_pandas()
+    # 2) Search using Qdrant
+    hits = qdrant.search(
+        collection_name=table,
+        query_vector=query_vec,
+        limit=limit,
+        with_payload=True,
+    )
 
-    # 3) Формируем ответ
+    # 3) Format results
     results = []
-    for _, row in df.iterrows():
-        md = row["metadata"]
+    for hit in hits:
+        pl = hit.payload or {}
+        md = pl.get("metadata", {})
         results.append({
             "index":     md.get("index"),
-            "text":      row["text"],
-            "filename":  md["filename"],
-            "file_type": md["file_type"],
-            "url":       md["url"],
-            "score":     float(row.get("_distance", 0))
+            "text":      pl.get("text"),
+            "filename":  md.get("filename"),
+            "file_type": md.get("file_type"),
+            "url":       md.get("url"),
+            "cloudinary_url": md.get("cloudinary_url"),
+            "score":     float(hit.score) if hit.score is not None else 0.0
         })
 
     return {"results": results}
@@ -1203,9 +1279,16 @@ async def search_sendable_by_index(
     #    This is much faster than a vector search.
     filter_q = f"metadata.index = '{query}'"
 
-    # 2) Execute the search using the .where() clause.
-    #    .to_list() is lightweight for retrieving a small number of records.
-    found_records = table.search().where(filter_q).limit(limit).to_list()
+    # 2) Execute the search using Qdrant filter
+    filter_q = qmodels.Filter(
+        must=[qmodels.FieldCondition(key="metadata.index", match=qmodels.MatchValue(value=query))]
+    )
+    found_records, _ = qdrant.scroll(
+        collection_name=table, 
+        scroll_filter=filter_q, 
+        with_payload=True, 
+        limit=limit
+    )
 
     # 3) Check if a record was found.
     if not found_records:
@@ -1215,14 +1298,14 @@ async def search_sendable_by_index(
         )
 
     # 4) Format and return the single result.
-    #    The client-side code expects the data object directly.
-    record = found_records[0]
-    metadata = record.get("metadata", {})
+    point = found_records[0]
+    payload = point.payload or {}
+    metadata = payload.get("metadata", {})
     
     # We construct a response object similar to the vector search for consistency.
     result = {
         "index":     metadata.get("index"),
-        "text":      record.get("text"),
+        "text":      payload.get("text"),
         "filename":  metadata.get("filename"),
         "file_type": metadata.get("file_type"),
         "url":       metadata.get("url"),
@@ -1252,16 +1335,24 @@ async def delete_sendable(
     # 1) Determine filter query and user-facing identifier
     if filename:
         safe_name = safe_decode_filename(filename)
-        filter_q = f"metadata.filename = '{safe_name}'"
+        filter_q = qmodels.Filter(
+            must=[qmodels.FieldCondition(key="metadata.filename", match=qmodels.MatchValue(value=safe_name))]
+        )
         identifier = f"filename '{safe_name}'"
     else: # We know index is not None here because of the validation above
-        filter_q = f"metadata.index = '{index}'"
+        filter_q = qmodels.Filter(
+            must=[qmodels.FieldCondition(key="metadata.index", match=qmodels.MatchValue(value=index))]
+        )
         identifier = f"index '{index}'"
 
     # 2) Find the record(s) to delete *before* deleting from the DB
     # We need the metadata to clean up GCS and Cloudinary
-    # Using .search().where() is more efficient than loading the whole table to pandas
-    records_to_delete = table.search().where(filter_q).to_list()
+    records_to_delete, _ = qdrant.scroll(
+        collection_name=table, 
+        scroll_filter=filter_q, 
+        with_payload=True, 
+        limit=10000
+    )
     
     deleted_count = len(records_to_delete)
     if deleted_count == 0:
@@ -1271,8 +1362,9 @@ async def delete_sendable(
         )
 
     # 3) Delete associated cloud assets (GCS and Cloudinary)
-    for record in records_to_delete:
-        metadata = record.get("metadata", {})
+    for point in records_to_delete:
+        payload = point.payload or {}
+        metadata = payload.get("metadata", {})
         
         # 3.1) Delete from Cloudinary if applicable
         public_id = metadata.get("cloudinary_public_id")
@@ -1293,8 +1385,8 @@ async def delete_sendable(
             except Exception as e:
                 print(f"Failed to delete {path} from GCS: {e}")
 
-    # 4) Delete from LanceDB (now that cloud assets are gone)
-    table.delete(filter_q)
+    # 4) Delete from Qdrant (now that cloud assets are gone)
+    qdrant.delete(collection_name=table, points_selector=qmodels.FilterSelector(filter=filter_q))
 
     return {
         "message": f"Successfully deleted {deleted_count} record(s) and associated files for {identifier}.",
@@ -1306,7 +1398,7 @@ async def delete_sendable(
 @app.post("/companies/{companyId}/transcribe-document")
 async def transcribe_document(companyId: str, file: UploadFile = File(...)):
     """
-    Берём файл, прогоняем через Docling, возвращаем текст. Не храним в LanceDB.
+    Берём файл, прогоняем через Docling, возвращаем текст. Не храним в Qdrant.
     """
     upload_dir = os.path.join("uploads", companyId, "transcriptions")
     os.makedirs(upload_dir, exist_ok=True)
@@ -1346,26 +1438,36 @@ async def download_sendable(
 @app.get("/companies/{companyId}/documents/list")
 async def list_documents(companyId: str):
     """
-    Returns a list of documents for a company from LanceDB,
+    Returns a list of documents for a company from Qdrant,
     including each file's name and metadata.
     """
-    # 1) Open the LanceDB table for this company
-    table = get_company_doc_table(companyId)
+    # 1) Get the collection for this company
+    collection = get_company_doc_table(companyId)
     
-    # 2) Convert all rows to a DataFrame
-    df = table.to_pandas()
-    
-    # 3) Group by filename to get unique documents
+    # 2) Scroll through all documents in Qdrant
     documents = {}
-    for _, row in df.iterrows():
-        metadata = row.get('metadata') or {}
-        filename = row["metadata"]["filename"]
-        if filename not in documents:
-            documents[filename] = {
-                "filename": filename,
-                "title": row["metadata"]["title"],
-                "url": row["metadata"]["url"]
-            }
+    cursor = None
+    while True:
+        batch, cursor = qdrant.scroll(
+            collection_name=collection, 
+            with_payload=True, 
+            limit=1000, 
+            offset=cursor
+        )
+        if not batch:
+            break
+        for point in batch:
+            payload = point.payload or {}
+            metadata = payload.get("metadata", {})
+            filename = metadata.get("filename")
+            if filename and filename not in documents:
+                documents[filename] = {
+                    "filename": filename,
+                    "title": metadata.get("title"),
+                    "url": metadata.get("url")
+                }
+        if cursor is None:
+            break
     
     # 4) Convert to list
     results = list(documents.values())
@@ -1374,23 +1476,34 @@ async def list_documents(companyId: str):
 
 @app.get("/companies/{companyId}/sendables/list")
 async def list_sendables(companyId: str):
-    sendable_table = get_company_sendable_table(companyId)
-    df = sendable_table.to_pandas()
+    collection = get_company_sendable_table(companyId)
     
     results = []
-    for _, row in df.iterrows():
-        metadata = row['metadata']
-        result_item = {
-            "index": metadata.get("index"),
-            "filename": metadata.get("filename"),
-            "text": row["text"],
-            "file_type": metadata.get("file_type"),
-            "url": metadata.get("url"), # GCS URL
-            "cloudinary_url": metadata.get("cloudinary_url")
-
-        }
-        results.append(result_item)
-
+    cursor = None
+    while True:
+        batch, cursor = qdrant.scroll(
+            collection_name=collection, 
+            with_payload=True, 
+            limit=1000, 
+            offset=cursor
+        )
+        if not batch:
+            break
+        for point in batch:
+            payload = point.payload or {}
+            metadata = payload.get("metadata", {})
+            result_item = {
+                "index": metadata.get("index"),
+                "filename": metadata.get("filename"),
+                "text": payload.get("text"),
+                "file_type": metadata.get("file_type"),
+                "url": metadata.get("url"),
+                "cloudinary_url": metadata.get("cloudinary_url")
+            }
+            results.append(result_item)
+        if cursor is None:
+            break
+    
     return {"sendables": results}
 
 @app.get("/companies/{companyId}/documents/content")
@@ -1399,33 +1512,57 @@ async def get_all_document_content(companyId: str):
     Returns the content of all documents for a company, including their text and metadata.
     This is useful for bulk processing or AI summarization of the entire document base.
     """
-    table = get_company_doc_table(companyId)
+    collection = get_company_doc_table(companyId)
     
-    # Get all documents from LanceDB
-    df = table.to_pandas()
-    
-    # Group chunks by filename to reconstruct full documents
+    # Get all documents from Qdrant
     documents = {}
-    for _, row in df.iterrows():
-        filename = row["metadata"]["filename"]
-        if filename not in documents:
-            documents[filename] = {
-                "filename": filename,
-                "title": row["metadata"]["title"],
-                "url": row["metadata"]["url"],
-                "chunks": []
-            }
-        documents[filename]["chunks"].append({
-            "text": row["text"],
-            "page_numbers": row["metadata"]["page_numbers"]
-        })
+    cursor = None
+    while True:
+        batch, cursor = qdrant.scroll(
+            collection_name=collection, 
+            with_payload=True, 
+            limit=1000, 
+            offset=cursor
+        )
+        if not batch:
+            break
+        for point in batch:
+            payload = point.payload or {}
+            metadata = payload.get("metadata", {})
+            filename = metadata.get("filename")
+            if not filename:
+                continue
+            if filename not in documents:
+                documents[filename] = {
+                    "filename": filename,
+                    "title": metadata.get("title"),
+                    "url": metadata.get("url"),
+                    "chunks": []
+                }
+            documents[filename]["chunks"].append({
+                "text": payload.get("text", ""),
+                "page_numbers": metadata.get("page_numbers")
+            })
+        if cursor is None:
+            break
     
     # Convert to list and sort chunks by page numbers
     result = []
     for doc in documents.values():
         # Sort chunks by page numbers if available
-        if doc["chunks"][0]["page_numbers"]:
-            doc["chunks"].sort(key=lambda x: min(x["page_numbers"]) if x["page_numbers"] else float('inf'))
+        first_pn = doc["chunks"][0].get("page_numbers") if doc["chunks"] else None
+        if first_pn:
+            def _min_page(x):
+                pn = x.get("page_numbers")
+                if isinstance(pn, str):
+                    try:
+                        pn = json.loads(pn)
+                    except Exception:
+                        pn = None
+                if isinstance(pn, list) and pn:
+                    return min(pn)
+                return float('inf')
+            doc["chunks"].sort(key=_min_page)
         
         # Combine all chunks into full text
         full_text = " ".join(chunk["text"] for chunk in doc["chunks"])
