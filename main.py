@@ -23,6 +23,7 @@ from docling.chunking import HybridChunker
 from openai import OpenAI
 from utils.tokenizer import OpenAITokenizerWrapper
 from utils.reranker import rerank_with_openai, rerank_with_jina
+from bm25 import meili_upsert, meili_search
 
 from google.oauth2 import service_account
 from google.cloud import storage
@@ -834,6 +835,40 @@ async def process_document(
             points.append(qmodels.PointStruct(id=point_id, vector=vector, payload=payload))
         
         qdrant.upsert(collection_name=table, wait=True, points=points)
+                # Upsert to BM25 (Meilisearch)
+                try:
+                    bm25_docs = []
+                    for i, item in enumerate(to_store):
+                        point_id = sha_id(companyId, safe_filename, str(i))
+                        md = item.get("metadata") or {}
+                        bm25_docs.append({
+                            "id": str(point_id),
+                            "title": md.get("title"),
+                            "text": item.get("text"),
+                            "filename": md.get("filename"),
+                            "url": md.get("url"),
+                        })
+                    meili_upsert(companyId, bm25_docs)
+                except Exception as meili_err:
+                    # Non-blocking failure; vector store remains source of truth
+                    print(f"BM25 upsert failed: {meili_err}")
+        # Upsert to BM25 (Meilisearch)
+        try:
+            bm25_docs = []
+            for i, item in enumerate(to_store):
+                point_id = sha_id(companyId, safe_filename, str(i))
+                md = item.get("metadata") or {}
+                bm25_docs.append({
+                    "id": str(point_id),
+                    "title": md.get("title"),
+                    "text": item.get("text"),
+                    "filename": md.get("filename"),
+                    "url": md.get("url"),
+                })
+            meili_upsert(companyId, bm25_docs)
+        except Exception as meili_err:
+            # Non-blocking failure; vector store remains source of truth
+            print(f"BM25 upsert failed: {meili_err}")
         total_count = qdrant.count(collection_name=table, exact=False).count
         
         response_obj = {
@@ -901,24 +936,25 @@ async def search_documents(
     rerank_enabled = use_openai or use_jina
     search_limit = rerankTopK or (OPENAI_RERANKER_TOP_K if rerank_enabled else limit)
     
-    # 3) Search using Qdrant (get more results if reranking)
+    # 3) Dense search (get enough for fusion)
+    dense_limit = max(50, search_limit)
     try:
         hits = qdrant.search(
             collection_name=table,
             query_vector=query_vec,
-            limit=search_limit,
+            limit=dense_limit,
             with_payload=True,
             score_threshold=None,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search error: {e}")
 
-    # 4) Format initial results
-    initial_results = []
+    # Keep IDs and a map of payloads
+    dense_ids = []
+    dense_map: Dict[str, Dict[str, Any]] = {}
     for hit in hits:
         pl = hit.payload or {}
         md = pl.get("metadata", {})
-        # Parse page numbers safely (stringified JSON, list, or None)
         pn_raw = md.get("page_numbers")
         page_numbers = None
         if isinstance(pn_raw, str):
@@ -929,23 +965,89 @@ async def search_documents(
         elif isinstance(pn_raw, list):
             page_numbers = pn_raw
 
-        initial_results.append({
-            "text":         pl.get("text"),
-            "filename":     md.get("filename"),
+        doc_id = str(hit.id)
+        dense_ids.append(doc_id)
+        dense_map[doc_id] = {
+            "id": doc_id,
+            "text": pl.get("text"),
+            "filename": md.get("filename"),
             "page_numbers": page_numbers,
-            "title":        md.get("title"),
-            "url":          md.get("url"),
-            "score":        float(hit.score) if hit.score is not None else 0.0  # Vector similarity score
-        })
-    
-    # 5) Apply reranking if enabled
+            "title": md.get("title"),
+            "url": md.get("url"),
+            "score": float(hit.score) if hit.score is not None else 0.0,
+        }
+
+    # 4) BM25 list from Meilisearch
+    try:
+        bm25_ids = meili_search(companyId, query, limit=50)
+    except Exception as meili_err:
+        print(f"BM25 search failed, proceeding with dense only: {meili_err}")
+        bm25_ids = []
+
+    # 5) RRF fusion
+    def _rrf_fuse(run_a: List[str], run_b: List[str], k: int = 60) -> List[str]:
+        scores: Dict[str, float] = {}
+        for run in (run_a, run_b):
+            for rank, doc_id in enumerate(run, start=1):
+                scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        return [doc_id for doc_id, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
+
+    fused_ids = _rrf_fuse(dense_ids, bm25_ids, k=60) if bm25_ids else dense_ids
+
+    # 6) Materialize top fused docs and backfill any missing from Qdrant
+    candidate_take = max(30, search_limit)
+    top_ids = fused_ids[:candidate_take]
+    initial_results: List[Dict[str, Any]] = []
+    missing_ids: List[str] = []
+    for doc_id in top_ids:
+        if doc_id in dense_map:
+            item = dense_map[doc_id].copy()
+            item.pop("id", None)
+            initial_results.append(item)
+        else:
+            missing_ids.append(doc_id)
+
+    if missing_ids:
+        try:
+            to_int_ids = []
+            for x in missing_ids:
+                try:
+                    to_int_ids.append(int(x, 16) if x.startswith("0x") else int(x))
+                except Exception:
+                    # Skip bad IDs
+                    continue
+            if to_int_ids:
+                retrieved = qdrant.retrieve(collection_name=table, ids=to_int_ids)
+                for pt in retrieved:
+                    pl = getattr(pt, "payload", {}) or {}
+                    md = pl.get("metadata", {})
+                    pn_raw = md.get("page_numbers")
+                    page_numbers = None
+                    if isinstance(pn_raw, str):
+                        try:
+                            page_numbers = json.loads(pn_raw)
+                        except Exception:
+                            page_numbers = None
+                    elif isinstance(pn_raw, list):
+                        page_numbers = pn_raw
+                    initial_results.append({
+                        "text": pl.get("text"),
+                        "filename": md.get("filename"),
+                        "page_numbers": page_numbers,
+                        "title": md.get("title"),
+                        "url": md.get("url"),
+                        "score": 0.0,
+                    })
+        except Exception as e:
+            print(f"Qdrant retrieve failed: {e}")
+
+    # 7) Optional reranking on fused head
     final_results = initial_results
-    rerank_metadata = {"reranked": False}
-    
+    rerank_metadata = {"reranked": False, "fusion": "rrf" if bm25_ids else "dense_only"}
+
     if rerank_enabled and len(initial_results) > 1:
         import time
         start_time = time.time()
-        
         try:
             if use_openai:
                 reranked_results = rerank_with_openai(
@@ -957,11 +1059,11 @@ async def search_documents(
                     model=OPENAI_RERANKER_MODEL,
                     timeout=OPENAI_RERANKER_TIMEOUT,
                 )
-                rerank_metadata = {
+                rerank_metadata.update({
                     "reranked": True,
                     "reranker_model": OPENAI_RERANKER_MODEL,
                     "reranker_provider": "openai",
-                }
+                })
             else:
                 reranked_results = rerank_with_jina(
                     query=query,
@@ -972,28 +1074,25 @@ async def search_documents(
                     endpoint=JINA_RERANKER_ENDPOINT,
                     timeout=JINA_RERANKER_TIMEOUT,
                 )
-                rerank_metadata = {
+                rerank_metadata.update({
                     "reranked": True,
                     "reranker_model": JINA_RERANKER_MODEL,
                     "reranker_provider": "jina",
-                }
+                })
             if reranked_results:
                 final_results = reranked_results
                 rerank_metadata.update({
                     "original_count": len(initial_results),
                     "reranked_count": len(final_results),
-                    "rerank_time_ms": int((time.time() - start_time) * 1000)
+                    "rerank_time_ms": int((time.time() - start_time) * 1000),
                 })
         except Exception as rerank_error:
-            print(f"Reranking failed, using vector results: {rerank_error}")
+            print(f"Reranking failed, using fused results: {rerank_error}")
             final_results = initial_results[:limit]
     else:
         final_results = initial_results[:limit]
-    
-    return {
-        "results": final_results,
-        **rerank_metadata
-    }
+
+    return {"results": final_results, **rerank_metadata}
 
 @app.delete("/companies/{companyId}/delete-document")
 async def delete_document(companyId: str, filename: str = Query(...)):
