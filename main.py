@@ -1638,7 +1638,8 @@ async def get_all_document_content(companyId: str):
                 }
             documents[filename]["chunks"].append({
                 "text": payload.get("text", ""),
-                "page_numbers": metadata.get("page_numbers")
+                "page_numbers": metadata.get("page_numbers"),
+                "title": metadata.get("title")  # Store section title with each chunk
             })
         if cursor is None:
             break
@@ -1663,9 +1664,24 @@ async def get_all_document_content(companyId: str):
         
         # Combine all chunks into full text
         full_text = " ".join(chunk["text"] for chunk in doc["chunks"])
+        
+        # Collect all section titles from chunks (skip None/empty titles)
+        section_titles = []
+        seen_titles = set()
+        for chunk in doc["chunks"]:
+            # Get the title from the chunk's metadata if stored there
+            chunk_title = None
+            if isinstance(chunk, dict):
+                chunk_title = chunk.get("title")
+            
+            if chunk_title and chunk_title not in seen_titles:
+                section_titles.append(chunk_title)
+                seen_titles.add(chunk_title)
+        
         result.append({
             "filename": doc["filename"],
-            "title": doc["title"],
+            "title": doc["title"],  # First encountered section title (kept for compatibility)
+            "section_titles": section_titles,  # All unique section titles in order
             "url": doc["url"],
             "content": full_text
         })
