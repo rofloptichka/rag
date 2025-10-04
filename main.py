@@ -77,13 +77,24 @@ cloudinary.config(
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start_time = time.perf_counter()
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        # Log the error safely without encoding issues
+        logging.getLogger("uvicorn.error").error(
+            f"Error processing {request.method} {request.url.path}: {repr(e)}"
+        )
+        raise
+    
     process_time_ms = (time.perf_counter() - start_time) * 1000.0
     response.headers["X-Process-Time-ms"] = f"{process_time_ms:.2f}"
     response.headers["Server-Timing"] = f"app;dur={process_time_ms:.2f}"
-    logging.getLogger("uvicorn.error").info(
-        f"{request.method} {request.url.path} completed in {process_time_ms:.2f} ms"
-    )
+    try:
+        logging.getLogger("uvicorn.error").info(
+            f"{request.method} {request.url.path} completed in {process_time_ms:.2f} ms"
+        )
+    except Exception:
+        pass  # Ignore logging errors
     return response
 
 # ------------------------------------------------------------------------------
@@ -152,10 +163,17 @@ def _count_tokens(text: str) -> int:
 # SSE helpers
 # ------------------------------------------------------------------------------
 def _sse_format(event: str, data: Any) -> str:
+    """Format data as Server-Sent Event with proper encoding handling."""
     try:
         payload = json.dumps(data, ensure_ascii=False)
-    except Exception:
-        payload = json.dumps({"message": str(data)})
+    except (TypeError, ValueError) as e:
+        # Fallback for non-serializable objects
+        try:
+            payload = json.dumps({"message": str(data)}, ensure_ascii=False)
+        except Exception:
+            payload = json.dumps({"message": repr(data), "error": "encoding_issue"})
+    except Exception as e:
+        payload = json.dumps({"error": "serialization_failed", "details": repr(e)})
     return f"event: {event}\ndata: {payload}\n\n"
 
 ## Reranker moved to utils/reranker.py
@@ -516,7 +534,7 @@ def get_company_sendable_table(company_id: str):
     return collection
 
 def safe_decode_filename(filename: str) -> str:
-    """Fixes improperly decoded filenames."""
+    """Fixes improperly decoded filenames with robust error handling."""
     try:
         # First try URL decoding in case the filename is URL-encoded
         decoded = urllib.parse.unquote(filename)
@@ -524,7 +542,14 @@ def safe_decode_filename(filename: str) -> str:
         return decoded.encode("latin1").decode("utf-8")
     except (UnicodeDecodeError, UnicodeEncodeError):
         # If any encoding/decoding fails, return the URL-decoded version
-        return urllib.parse.unquote(filename)
+        try:
+            return urllib.parse.unquote(filename)
+        except Exception:
+            # Last resort: return as-is
+            return filename
+    except Exception:
+        # Catch-all: return filename as-is
+        return filename
 
 def upload_to_gcs(content: bytes, company_id: str, folder: str, filename: str, content_type: str) -> str:
     """Uploads content to Google Cloud Storage."""
@@ -808,7 +833,10 @@ async def process_document(
                     },
                 }
                 to_store.append(item)
-                print({"chunk_index": i, "title": item["metadata"]["title"], "preview": item["text"][:160]})
+                try:
+                    print({"chunk_index": i, "title": item["metadata"]["title"], "preview": item["text"][:160]})
+                except Exception:
+                    pass  # Ignore print errors
         else:
             for i, chunk in enumerate(chunks):
                 page_nums = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}) or []
@@ -823,7 +851,10 @@ async def process_document(
                     },
                 }
                 to_store.append(item)
-                print({"chunk_index": i, "title": item["metadata"]["title"], "preview": item["text"][:160], "pages": page_nums})
+                try:
+                    print({"chunk_index": i, "title": item["metadata"]["title"], "preview": item["text"][:160], "pages": page_nums})
+                except Exception:
+                    pass  # Ignore print errors
 
         if not to_store:
             raise ValueError("No chunks were prepared for storage")
@@ -1638,7 +1669,10 @@ async def get_all_document_content(companyId: str):
             "url": doc["url"],
             "content": full_text
         })
-    print(result)
+    try:
+        print(f"Returning {len(result)} documents with total content length: {sum(len(d.get('content', '')) for d in result)}")
+    except Exception:
+        pass  # Ignore print errors
     return {"documents": result}
 
 
