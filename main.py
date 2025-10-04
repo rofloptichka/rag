@@ -476,9 +476,23 @@ def sha_id(*parts: str) -> int:
     return int(h[:16], 16)
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    # Batch embeddings to reduce overhead; OpenAI supports batching via list input
-    resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
-    return [d.embedding for d in resp.data]
+    """Generate embeddings for a list of texts. Raises HTTPException on failure."""
+    try:
+        # Batch embeddings to reduce overhead; OpenAI supports batching via list input
+        resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
+        return [d.embedding for d in resp.data]
+    except Exception as e:
+        error_msg = str(e)
+        if "429" in error_msg or "rate_limit" in error_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="OpenAI API rate limit exceeded during document processing. Please try again in a few moments."
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate embeddings: {error_msg}"
+            )
 
 # ------------------------------------------------------------------------------
 # Pydantic models for request bodies
@@ -876,11 +890,24 @@ async def search_documents(
     table = get_company_doc_table(companyId)
 
     # 1) Get embedding for the query
-    emb_resp = client.embeddings.create(
-        model="text-embedding-3-large",
-        input=query
-    )
-    query_vec = emb_resp.data[0].embedding
+    try:
+        emb_resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=query
+        )
+        query_vec = emb_resp.data[0].embedding
+    except Exception as e:
+        error_msg = str(e)
+        if "429" in error_msg or "rate_limit" in error_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="OpenAI API rate limit exceeded. Please try again in a few moments."
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate query embedding: {error_msg}"
+            )
 
     # 2) Determine reranker provider and search limits
     provider = (rerankerProvider or "").strip().lower() if rerankerProvider else None
@@ -1127,11 +1154,24 @@ async def process_sendable_file(
 
 
     # 3) Generate embedding for the description
-    emb_resp = client.embeddings.create(
-        model="text-embedding-3-large",
-        input=description
-    )
-    embedding = emb_resp.data[0].embedding
+    try:
+        emb_resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=description
+        )
+        embedding = emb_resp.data[0].embedding
+    except Exception as e:
+        error_msg = str(e)
+        if "429" in error_msg or "rate_limit" in error_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="OpenAI API rate limit exceeded. Please try again in a few moments."
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate embedding: {error_msg}"
+            )
 
     # 4) Prepare record and save to Qdrant
     metadata = {
@@ -1205,11 +1245,24 @@ async def update_sendable_description(
         )
 
     # 2) Recalculate embedding for the new description
-    emb_resp = client.embeddings.create(
-        model="text-embedding-3-large",
-        input=new_description
-    )
-    new_embedding = emb_resp.data[0].embedding
+    try:
+        emb_resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=new_description
+        )
+        new_embedding = emb_resp.data[0].embedding
+    except Exception as e:
+        error_msg = str(e)
+        if "429" in error_msg or "rate_limit" in error_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="OpenAI API rate limit exceeded. Please try again in a few moments."
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate embedding: {error_msg}"
+            )
 
     # 3) Update with new description and vector
     point = found_records[0]
@@ -1230,11 +1283,24 @@ async def search_sendable(
     table = get_company_sendable_table(companyId)
 
     # 1) Получаем embedding для запроса
-    emb_resp = client.embeddings.create(
-        model="text-embedding-3-large",
-        input=query
-    )
-    query_vec = emb_resp.data[0].embedding
+    try:
+        emb_resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=query
+        )
+        query_vec = emb_resp.data[0].embedding
+    except Exception as e:
+        error_msg = str(e)
+        if "429" in error_msg or "rate_limit" in error_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="OpenAI API rate limit exceeded. Please try again in a few moments."
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate query embedding: {error_msg}"
+            )
 
     # 2) Search using Qdrant
     hits = qdrant.search(
