@@ -107,10 +107,8 @@ def _parse_bool_env(value: Optional[str], default: bool) -> bool:
 
 RAG_USE_LLM_UNDERSTAND_DEFAULT = _parse_bool_env(os.getenv("RAG_USE_LLM_UNDERSTAND"), False)
 RAG_NATURAL_CHUNKING_DEFAULT   = _parse_bool_env(os.getenv("RAG_NATURAL_CHUNKING"), True)
-RAG_LLM_RESTRUCTURE_DEFAULT    = _parse_bool_env(os.getenv("RAG_LLM_RESTRUCTURE"), True)
 RAG_SOFT_MAX_TOKENS            = int(os.getenv("RAG_SOFT_MAX_TOKENS", "900"))
 RAG_HARD_MAX_TOKENS            = int(os.getenv("RAG_HARD_MAX_TOKENS", "1800"))
-LLM_SUM_MODEL                  = os.getenv("LLM_SUM_MODEL", "gpt-4.1-mini")
 
 # OpenAI reranker configuration
 OPENAI_RERANKER_ENABLED        = _parse_bool_env(os.getenv("OPENAI_RERANKER_ENABLED"), False)
@@ -360,52 +358,6 @@ def _build_natural_chunks(
     return chunks
 
 # ------------------------------------------------------------------------------
-# LLM document restructuring for clean knowledge base
-# ------------------------------------------------------------------------------
-def _llm_restructure_document(markdown_text: str) -> str:
-    """
-    Use LLM to restructure the entire document into clean, well-organized sections
-    with clear topic separation for better chunking.
-    """
-    try:
-        resp = client.chat.completions.create(
-            model=LLM_SUM_MODEL,
-            messages=[
-                {
-                    "role": "system", 
-                    "content": (
-                        "You are a knowledge base organizer. The headers you organize will be as separate chunks for an LLM's context. Try to preserve all needed context to LLM about one thing in one header.Restructure the given document into "
-                        "clear, well-separated sections with proper headings. Each section should focus on "
-                        "ONE specific topic. CRITICALLY IMPORTANT: Preserve ALL elements. DO NOT DELETE ANYTHING."
-                        "Use markdown format with ## headings. Preserve ALL original information including "
-                        "conversational scripts, pricing discussions, and sales elements. Just organize it logically by topic."
-                    )
-                },
-                {
-                    "role": "user", 
-                    "content": (
-                        "Restructure this document into clean sections with proper topic separation. "
-                        "PRESERVE ALL conversational scripts, customer questions, staff responses, pricing info, "
-                        "and sales techniques. Just organize by topic with clear ## headings:\n\n" + 
-                        markdown_text
-                    )
-                },
-            ],
-            temperature=0.1,
-            max_tokens=4000,
-        )
-        restructured = resp.choices[0].message.content if resp.choices else None
-        if restructured:
-            print(f"LLM restructured document: {len(restructured)} chars")
-            return restructured
-        else:
-            print("LLM restructuring failed, using original")
-            return markdown_text
-    except Exception as e:
-        print(f"LLM restructuring error: {e}")
-        return markdown_text
-
-# ------------------------------------------------------------------------------
 # Optional: LLM understanding pass per section (best-effort, non-blocking)
 # ------------------------------------------------------------------------------
 def _llm_understand_sections(sections: List[Dict[str, Any]], max_sections: int = 50) -> Dict[str, Any]:
@@ -454,7 +406,7 @@ def company_sendable_collection(company_id: str) -> str:
     return f"sendable_files_{company_id}"
 
 def ensure_collection(name: str):
-    """Create Qdrant collection if missing with HNSW index tuned for latency."""
+    """Create Qdrant collection if missing with HNSW index tuned for latency and sparse vectors."""
     try:
         qdrant.get_collection(name)
         return
@@ -463,10 +415,19 @@ def ensure_collection(name: str):
 
     qdrant.recreate_collection(
         collection_name=name,
-        vectors_config=qmodels.VectorParams(
-            size=EMBED_DIMS,
-            distance=qmodels.Distance.COSINE,
-        ),
+        vectors_config={
+            "dense": qmodels.VectorParams(
+                size=EMBED_DIMS,
+                distance=qmodels.Distance.COSINE,
+            )
+        },
+        sparse_vectors_config={
+            "sparse": qmodels.SparseVectorParams(
+                index=qmodels.SparseIndexParams(
+                    on_disk=False,
+                )
+            )
+        },
         hnsw_config=qmodels.HnswConfigDiff(m=32, ef_construct=256),
         optimizers_config=qmodels.OptimizersConfigDiff(
             default_segment_number=2,
@@ -511,6 +472,73 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
                 status_code=500,
                 detail=f"Failed to generate embeddings: {error_msg}"
             )
+
+def create_sparse_vector(text: str) -> qmodels.SparseVector:
+    """Create BM25-style sparse vector from text using simple term frequency."""
+    # Simple tokenization: lowercase, remove punctuation, split by whitespace
+    tokens = re.findall(r'\b\w+\b', text.lower())
+    
+    # Count term frequencies
+    term_freq: Dict[str, int] = {}
+    for token in tokens:
+        if len(token) > 2:  # Skip very short tokens
+            term_freq[token] = term_freq.get(token, 0) + 1
+    
+    # Convert to sparse vector format (index: hash of term, value: frequency)
+    indices = []
+    values = []
+    for term, freq in term_freq.items():
+        # Use hash to create consistent numeric indices
+        index = hash(term) % (2**31)  # Keep within 32-bit int range
+        indices.append(index)
+        values.append(float(freq))
+    
+    return qmodels.SparseVector(indices=indices, values=values)
+
+def reciprocal_rank_fusion(
+    dense_results: List[Dict[str, Any]], 
+    sparse_results: List[Dict[str, Any]], 
+    k: int = 60
+) -> List[Dict[str, Any]]:
+    """
+    Combine dense and sparse search results using Reciprocal Rank Fusion (RRF).
+    
+    Args:
+        dense_results: Results from dense vector search
+        sparse_results: Results from sparse vector search
+        k: RRF constant (default: 60)
+    
+    Returns:
+        Fused and re-ranked results
+    """
+    # Create a map of document ID to combined score
+    scores: Dict[str, float] = {}
+    doc_map: Dict[str, Dict[str, Any]] = {}
+    
+    # Process dense results
+    for rank, doc in enumerate(dense_results, start=1):
+        doc_id = doc.get("filename", "") + doc.get("text", "")[:50]
+        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        doc_map[doc_id] = doc
+    
+    # Process sparse results
+    for rank, doc in enumerate(sparse_results, start=1):
+        doc_id = doc.get("filename", "") + doc.get("text", "")[:50]
+        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        if doc_id not in doc_map:
+            doc_map[doc_id] = doc
+    
+    # Sort by combined RRF score
+    sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    
+    # Return documents in order with RRF scores
+    results = []
+    for doc_id, rrf_score in sorted_docs:
+        doc = doc_map[doc_id].copy()
+        doc["rrf_score"] = rrf_score
+        results.append(doc)
+    
+    return results
 
 # ------------------------------------------------------------------------------
 # Pydantic models for request bodies
@@ -591,7 +619,6 @@ async def process_document(
     file: UploadFile = File(...),
     llmEnrich: Optional[bool] = Query(None, description="Use LLM understanding pass"),
     naturalChunking: Optional[bool] = Query(None, description="Use paragraph/sentence natural chunking"),
-    llmRestructure: Optional[bool] = Query(None, description="Use LLM to restructure document for clean topic separation"),
     softMaxTokens: Optional[int] = Query(None, description="Soft token cap for natural chunks"),
     hardMaxTokens: Optional[int] = Query(None, description="Hard token cap for natural chunks"),
     stream: Optional[bool] = Query(False, description="Stream processing updates via SSE"),
@@ -645,16 +672,11 @@ async def process_document(
                 # Resolve flags
                 use_llm = llmEnrich if llmEnrich is not None else RAG_USE_LLM_UNDERSTAND_DEFAULT
                 use_natural = naturalChunking if naturalChunking is not None else RAG_NATURAL_CHUNKING_DEFAULT
-                use_restructure = llmRestructure if llmRestructure is not None else RAG_LLM_RESTRUCTURE_DEFAULT
                 soft_cap = int(softMaxTokens) if softMaxTokens else RAG_SOFT_MAX_TOKENS
                 hard_cap = int(hardMaxTokens) if hardMaxTokens else RAG_HARD_MAX_TOKENS
 
-                # Optional LLM document restructuring for clean topic separation
+                # Use markdown directly from Docling (no LLM restructuring)
                 final_markdown = markdown_output
-                if use_restructure:
-                    yield _sse_format("status", {"step": "llm_restructure", "message": "Restructuring document with LLM for clean topic separation"})
-                    final_markdown = _llm_restructure_document(markdown_output)
-                    yield _sse_format("debug", {"restructured_preview": final_markdown[:500]})
 
                 # Extract sections
                 yield _sse_format("status", {"step": "extract_sections", "message": "Extracting sections from markdown"})
@@ -724,7 +746,7 @@ async def process_document(
                 # Store in Qdrant
                 yield _sse_format("status", {"step": "store", "message": f"Storing {len(to_store)} chunks"})
                 
-                # Convert to Qdrant format
+                # Convert to Qdrant format with dense and sparse vectors
                 # Include section title in the text we embed so titles influence search
                 embed_inputs = []
                 for item in to_store:
@@ -733,15 +755,31 @@ async def process_document(
                         embed_inputs.append(f"Title: {title}\n\n{item['text']}")
                     else:
                         embed_inputs.append(item["text"])
-                vectors = embed_texts(embed_inputs)
+                
+                # Generate dense vectors
+                dense_vectors = embed_texts(embed_inputs)
+                
+                # Build points with both dense and sparse vectors
                 points = []
-                for i, (item, vector) in enumerate(zip(to_store, vectors)):
+                for i, (item, dense_vec) in enumerate(zip(to_store, dense_vectors)):
                     point_id = sha_id(companyId, safe_filename, str(i))
+                    
+                    # Create sparse vector from text
+                    sparse_vec = create_sparse_vector(item["text"])
+                    
                     payload = {
                         "text": item["text"],
                         "metadata": item["metadata"]
                     }
-                    points.append(qmodels.PointStruct(id=point_id, vector=vector, payload=payload))
+                    
+                    points.append(qmodels.PointStruct(
+                        id=point_id, 
+                        vector={
+                            "dense": dense_vec,
+                            "sparse": sparse_vec
+                        },
+                        payload=payload
+                    ))
                 
                 qdrant.upsert(collection_name=table, wait=True, points=points)
                 total_count = qdrant.count(collection_name=table, exact=False).count
@@ -752,7 +790,6 @@ async def process_document(
                     "url": gcs_url,
                     "natural": bool(use_natural),
                     "llm": bool(use_llm),
-                    "restructured": bool(use_restructure),
                 })
             except Exception as e:
                 yield _sse_format("error", {"message": str(e)})
@@ -790,14 +827,11 @@ async def process_document(
         # Resolve flags
         use_llm = llmEnrich if llmEnrich is not None else RAG_USE_LLM_UNDERSTAND_DEFAULT
         use_natural = naturalChunking if naturalChunking is not None else RAG_NATURAL_CHUNKING_DEFAULT
-        use_restructure = llmRestructure if llmRestructure is not None else RAG_LLM_RESTRUCTURE_DEFAULT
         soft_cap = int(softMaxTokens) if softMaxTokens else RAG_SOFT_MAX_TOKENS
         hard_cap = int(hardMaxTokens) if hardMaxTokens else RAG_HARD_MAX_TOKENS
 
-        # Optional LLM document restructuring for clean topic separation
+        # Use markdown directly from Docling (no LLM restructuring)
         final_markdown = markdown_output
-        if use_restructure:
-            final_markdown = _llm_restructure_document(markdown_output)
 
         # Extract sections
         sections = _extract_sections_from_markdown(final_markdown)
@@ -859,7 +893,7 @@ async def process_document(
         if not to_store:
             raise ValueError("No chunks were prepared for storage")
 
-        # Convert to Qdrant format and store
+        # Convert to Qdrant format and store with dense and sparse vectors
         # Include section title in the text we embed so titles influence search
         embed_inputs = []
         for item in to_store:
@@ -868,15 +902,31 @@ async def process_document(
                 embed_inputs.append(f"Title: {title}\n\n{item['text']}")
             else:
                 embed_inputs.append(item["text"])
-        vectors = embed_texts(embed_inputs)
+        
+        # Generate dense vectors
+        dense_vectors = embed_texts(embed_inputs)
+        
+        # Build points with both dense and sparse vectors
         points = []
-        for i, (item, vector) in enumerate(zip(to_store, vectors)):
+        for i, (item, dense_vec) in enumerate(zip(to_store, dense_vectors)):
             point_id = sha_id(companyId, safe_filename, str(i))
+            
+            # Create sparse vector from text
+            sparse_vec = create_sparse_vector(item["text"])
+            
             payload = {
                 "text": item["text"],
                 "metadata": item["metadata"]
             }
-            points.append(qmodels.PointStruct(id=point_id, vector=vector, payload=payload))
+            
+            points.append(qmodels.PointStruct(
+                id=point_id, 
+                vector={
+                    "dense": dense_vec,
+                    "sparse": sparse_vec
+                },
+                payload=payload
+            ))
         
         qdrant.upsert(collection_name=table, wait=True, points=points)
         total_count = qdrant.count(collection_name=table, exact=False).count
@@ -887,7 +937,6 @@ async def process_document(
             "url": gcs_url,
             "natural": bool(use_natural),
             "llm": bool(use_llm),
-            "restructured": bool(use_restructure),
         }
         if use_llm and insights:
             response_obj["insights_preview"] = insights.get("sections", [])[:2]
@@ -913,20 +962,21 @@ async def search_documents(
     useReranker: bool = Query(True, description="Use reranker for better results"),
     rerankTopK: Optional[int] = Query(None, description="Number of docs to retrieve before reranking"),
     rerankerProvider: Optional[str] = Query(None, description="'openai' or 'jina' (overrides env flags)"),
+    useHybrid: bool = Query(True, description="Use hybrid search (dense + sparse with RRF)"),
 ):
     """
-    Search through company documents using semantic search.
+    Search through company documents using hybrid semantic + keyword search with RRF fusion.
     Returns matching chunks with their metadata and relevance scores.
     """
     table = get_company_doc_table(companyId)
 
-    # 1) Get embedding for the query
+    # 1) Get dense embedding for the query
     try:
         emb_resp = client.embeddings.create(
             model="text-embedding-3-large",
             input=query
         )
-        query_vec = emb_resp.data[0].embedding
+        query_dense_vec = emb_resp.data[0].embedding
     except Exception as e:
         error_msg = str(e)
         if "429" in error_msg or "rate_limit" in error_msg.lower():
@@ -959,46 +1009,107 @@ async def search_documents(
     rerank_enabled = use_openai or use_jina
     search_limit = rerankTopK or (OPENAI_RERANKER_TOP_K if rerank_enabled else limit)
     
-    # 3) Search using Qdrant (get more results if reranking)
-    try:
-        hits = qdrant.search(
-            collection_name=table,
-            query_vector=query_vec,
-            limit=search_limit,
-            with_payload=True,
-            score_threshold=None,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search error: {e}")
-
-    # 4) Format initial results
+    # 3) Hybrid search: dense + sparse with RRF fusion
     initial_results = []
-    for hit in hits:
-        pl = hit.payload or {}
-        md = pl.get("metadata", {})
-        # Parse page numbers safely (stringified JSON, list, or None)
-        pn_raw = md.get("page_numbers")
-        page_numbers = None
-        if isinstance(pn_raw, str):
-            try:
-                page_numbers = json.loads(pn_raw)
-            except Exception:
-                page_numbers = None
-        elif isinstance(pn_raw, list):
-            page_numbers = pn_raw
-
-        initial_results.append({
-            "text":         pl.get("text"),
-            "filename":     md.get("filename"),
-            "page_numbers": page_numbers,
-            "title":        md.get("title"),
-            "url":          md.get("url"),
-            "score":        float(hit.score) if hit.score is not None else 0.0  # Vector similarity score
-        })
     
-    # 5) Apply reranking if enabled
+    if useHybrid:
+        try:
+            # 3a) Dense vector search
+            dense_hits = qdrant.search(
+                collection_name=table,
+                query_vector=("dense", query_dense_vec),
+                limit=search_limit,
+                with_payload=True,
+                score_threshold=None,
+            )
+            
+            # 3b) Sparse vector search (BM25-style)
+            query_sparse_vec = create_sparse_vector(query)
+            sparse_hits = qdrant.search(
+                collection_name=table,
+                query_vector=("sparse", query_sparse_vec),
+                limit=search_limit,
+                with_payload=True,
+                score_threshold=None,
+            )
+            
+            # 3c) Format results
+            def format_hits(hits, score_prefix=""):
+                results = []
+                for hit in hits:
+                    pl = hit.payload or {}
+                    md = pl.get("metadata", {})
+                    pn_raw = md.get("page_numbers")
+                    page_numbers = None
+                    if isinstance(pn_raw, str):
+                        try:
+                            page_numbers = json.loads(pn_raw)
+                        except Exception:
+                            page_numbers = None
+                    elif isinstance(pn_raw, list):
+                        page_numbers = pn_raw
+
+                    results.append({
+                        "text":         pl.get("text"),
+                        "filename":     md.get("filename"),
+                        "page_numbers": page_numbers,
+                        "title":        md.get("title"),
+                        "url":          md.get("url"),
+                        "score":        float(hit.score) if hit.score is not None else 0.0
+                    })
+                return results
+            
+            dense_results = format_hits(dense_hits, "dense")
+            sparse_results = format_hits(sparse_hits, "sparse")
+            
+            # 3d) Apply RRF fusion
+            initial_results = reciprocal_rank_fusion(dense_results, sparse_results)
+            
+        except Exception as e:
+            # Fallback to dense-only search if hybrid fails
+            print(f"Hybrid search failed, falling back to dense-only: {e}")
+            useHybrid = False
+    
+    # Fallback: dense-only search
+    if not useHybrid:
+        try:
+            hits = qdrant.search(
+                collection_name=table,
+                query_vector=("dense", query_dense_vec),
+                limit=search_limit,
+                with_payload=True,
+                score_threshold=None,
+            )
+            
+            # Format dense-only results
+            initial_results = []
+            for hit in hits:
+                pl = hit.payload or {}
+                md = pl.get("metadata", {})
+                pn_raw = md.get("page_numbers")
+                page_numbers = None
+                if isinstance(pn_raw, str):
+                    try:
+                        page_numbers = json.loads(pn_raw)
+                    except Exception:
+                        page_numbers = None
+                elif isinstance(pn_raw, list):
+                    page_numbers = pn_raw
+
+                initial_results.append({
+                    "text":         pl.get("text"),
+                    "filename":     md.get("filename"),
+                    "page_numbers": page_numbers,
+                    "title":        md.get("title"),
+                    "url":          md.get("url"),
+                    "score":        float(hit.score) if hit.score is not None else 0.0
+                })
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Search error: {e}")
+    
+    # 4) Apply reranking if enabled
     final_results = initial_results
-    rerank_metadata = {"reranked": False}
+    rerank_metadata = {"reranked": False, "hybrid": useHybrid}
     
     if rerank_enabled and len(initial_results) > 1:
         import time
@@ -1190,7 +1301,7 @@ async def process_sendable_file(
             model="text-embedding-3-large",
             input=description
         )
-        embedding = emb_resp.data[0].embedding
+        dense_embedding = emb_resp.data[0].embedding
     except Exception as e:
         error_msg = str(e)
         if "429" in error_msg or "rate_limit" in error_msg.lower():
@@ -1204,7 +1315,7 @@ async def process_sendable_file(
                 detail=f"Failed to generate embedding: {error_msg}"
             )
 
-    # 4) Prepare record and save to Qdrant
+    # 4) Prepare record and save to Qdrant with dense and sparse vectors
     metadata = {
         "index": sendable_index,
         "file_type": (file.content_type or os.path.splitext(safe_name)[1]),
@@ -1219,8 +1330,18 @@ async def process_sendable_file(
         "metadata": metadata
     }
     
+    # Create sparse vector from description
+    sparse_embedding = create_sparse_vector(description)
+    
     point_id = sha_id(companyId, "sendable", safe_name)
-    point = qmodels.PointStruct(id=point_id, vector=embedding, payload=payload)
+    point = qmodels.PointStruct(
+        id=point_id, 
+        vector={
+            "dense": dense_embedding,
+            "sparse": sparse_embedding
+        },
+        payload=payload
+    )
     qdrant.upsert(collection_name=table, points=[point], wait=True)
 
     ### MODIFIED ###
@@ -1275,13 +1396,13 @@ async def update_sendable_description(
             detail=f"Multiple sendables with filename '{safe_name}' found. Data integrity issue."
         )
 
-    # 2) Recalculate embedding for the new description
+    # 2) Recalculate embeddings for the new description
     try:
         emb_resp = client.embeddings.create(
             model="text-embedding-3-large",
             input=new_description
         )
-        new_embedding = emb_resp.data[0].embedding
+        new_dense_embedding = emb_resp.data[0].embedding
     except Exception as e:
         error_msg = str(e)
         if "429" in error_msg or "rate_limit" in error_msg.lower():
@@ -1295,12 +1416,22 @@ async def update_sendable_description(
                 detail=f"Failed to generate embedding: {error_msg}"
             )
 
-    # 3) Update with new description and vector
+    # 3) Update with new description and vectors (dense + sparse)
     point = found_records[0]
     payload = point.payload or {}
     payload["text"] = new_description
     
-    updated_point = qmodels.PointStruct(id=point.id, vector=new_embedding, payload=payload)
+    # Create new sparse vector
+    new_sparse_embedding = create_sparse_vector(new_description)
+    
+    updated_point = qmodels.PointStruct(
+        id=point.id, 
+        vector={
+            "dense": new_dense_embedding,
+            "sparse": new_sparse_embedding
+        },
+        payload=payload
+    )
     qdrant.upsert(collection_name=table, points=[updated_point], wait=True)
 
     return {"message": f"Description for '{safe_name}' updated successfully."}
@@ -1309,17 +1440,18 @@ async def update_sendable_description(
 async def search_sendable(
     companyId: str,
     query:     str   = Query(...),
-    limit:     int   = Query(5)
+    limit:     int   = Query(5),
+    useHybrid: bool  = Query(True, description="Use hybrid search (dense + sparse with RRF)")
 ):
     table = get_company_sendable_table(companyId)
 
-    # 1) Получаем embedding для запроса
+    # 1) Get dense embedding for the query
     try:
         emb_resp = client.embeddings.create(
             model="text-embedding-3-large",
             input=query
         )
-        query_vec = emb_resp.data[0].embedding
+        query_dense_vec = emb_resp.data[0].embedding
     except Exception as e:
         error_msg = str(e)
         if "429" in error_msg or "rate_limit" in error_msg.lower():
@@ -1333,30 +1465,79 @@ async def search_sendable(
                 detail=f"Failed to generate query embedding: {error_msg}"
             )
 
-    # 2) Search using Qdrant
-    hits = qdrant.search(
-        collection_name=table,
-        query_vector=query_vec,
-        limit=limit,
-        with_payload=True,
-    )
-
-    # 3) Format results
+    # 2) Hybrid search with RRF fusion
     results = []
-    for hit in hits:
-        pl = hit.payload or {}
-        md = pl.get("metadata", {})
-        results.append({
-            "index":     md.get("index"),
-            "text":      pl.get("text"),
-            "filename":  md.get("filename"),
-            "file_type": md.get("file_type"),
-            "url":       md.get("url"),
-            "cloudinary_url": md.get("cloudinary_url"),
-            "score":     float(hit.score) if hit.score is not None else 0.0
-        })
+    
+    if useHybrid:
+        try:
+            # Dense search
+            dense_hits = qdrant.search(
+                collection_name=table,
+                query_vector=("dense", query_dense_vec),
+                limit=limit * 2,  # Get more for fusion
+                with_payload=True,
+            )
+            
+            # Sparse search
+            query_sparse_vec = create_sparse_vector(query)
+            sparse_hits = qdrant.search(
+                collection_name=table,
+                query_vector=("sparse", query_sparse_vec),
+                limit=limit * 2,
+                with_payload=True,
+            )
+            
+            # Format results
+            def format_sendable_hits(hits):
+                formatted = []
+                for hit in hits:
+                    pl = hit.payload or {}
+                    md = pl.get("metadata", {})
+                    formatted.append({
+                        "index":     md.get("index"),
+                        "text":      pl.get("text"),
+                        "filename":  md.get("filename"),
+                        "file_type": md.get("file_type"),
+                        "url":       md.get("url"),
+                        "cloudinary_url": md.get("cloudinary_url"),
+                        "score":     float(hit.score) if hit.score is not None else 0.0
+                    })
+                return formatted
+            
+            dense_results = format_sendable_hits(dense_hits)
+            sparse_results = format_sendable_hits(sparse_hits)
+            
+            # Apply RRF fusion
+            fused = reciprocal_rank_fusion(dense_results, sparse_results)
+            results = fused[:limit]
+            
+        except Exception as e:
+            print(f"Hybrid search failed for sendables, falling back to dense-only: {e}")
+            useHybrid = False
+    
+    # Fallback: dense-only search
+    if not useHybrid:
+        hits = qdrant.search(
+            collection_name=table,
+            query_vector=("dense", query_dense_vec),
+            limit=limit,
+            with_payload=True,
+        )
+        
+        for hit in hits:
+            pl = hit.payload or {}
+            md = pl.get("metadata", {})
+            results.append({
+                "index":     md.get("index"),
+                "text":      pl.get("text"),
+                "filename":  md.get("filename"),
+                "file_type": md.get("file_type"),
+                "url":       md.get("url"),
+                "cloudinary_url": md.get("cloudinary_url"),
+                "score":     float(hit.score) if hit.score is not None else 0.0
+            })
 
-    return {"results": results}
+    return {"results": results, "hybrid": useHybrid}
 
 
 @app.get("/companies/{companyId}/search-sendable-index")
