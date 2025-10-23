@@ -107,8 +107,8 @@ def _parse_bool_env(value: Optional[str], default: bool) -> bool:
 
 RAG_USE_LLM_UNDERSTAND_DEFAULT = _parse_bool_env(os.getenv("RAG_USE_LLM_UNDERSTAND"), False)
 RAG_NATURAL_CHUNKING_DEFAULT   = _parse_bool_env(os.getenv("RAG_NATURAL_CHUNKING"), True)
-RAG_SOFT_MAX_TOKENS            = int(os.getenv("RAG_SOFT_MAX_TOKENS", "900"))
-RAG_HARD_MAX_TOKENS            = int(os.getenv("RAG_HARD_MAX_TOKENS", "1800"))
+RAG_SOFT_MAX_TOKENS            = int(os.getenv("RAG_SOFT_MAX_TOKENS", "300"))
+RAG_HARD_MAX_TOKENS            = int(os.getenv("RAG_HARD_MAX_TOKENS", "700"))
 
 # OpenAI reranker configuration
 OPENAI_RERANKER_ENABLED        = _parse_bool_env(os.getenv("OPENAI_RERANKER_ENABLED"), False)
@@ -1167,7 +1167,7 @@ async def search_documents(
 @app.delete("/companies/{companyId}/delete-document")
 async def delete_document(companyId: str, filename: str = Query(...)):
     """
-    Delete a document and its chunks from both Qdrant and GCS.
+    Delete a document and its chunks from bsooth Qdrant and GCS.
     The filename parameter should be just the filename, not a JSON object.
     """
     # 1) Get the table
