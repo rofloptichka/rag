@@ -1015,6 +1015,7 @@ async def search_documents(
     if useHybrid:
         try:
             # 3a) Dense vector search
+            print(f"[Hybrid Search] Starting dense vector search with limit={search_limit}")
             dense_hits = qdrant.search(
                 collection_name=table,
                 query_vector=("dense", query_dense_vec),
@@ -1022,9 +1023,16 @@ async def search_documents(
                 with_payload=True,
                 score_threshold=None,
             )
+            print(f"[Hybrid Search] Dense search returned {len(dense_hits)} results")
+            if dense_hits:
+                print(f"[Hybrid Search] Top dense score: {dense_hits[0].score:.4f}")
             
             # 3b) Sparse vector search (BM25-style)
+            print(f"[Hybrid Search] Creating sparse vector from query")
             query_sparse_vec = create_sparse_vector(query)
+            print(f"[Hybrid Search] Sparse vector has {len(query_sparse_vec.indices)} terms")
+            
+            print(f"[Hybrid Search] Starting sparse vector search with limit={search_limit}")
             sparse_hits = qdrant.search(
                 collection_name=table,
                 query_vector=("sparse", query_sparse_vec),
@@ -1032,6 +1040,9 @@ async def search_documents(
                 with_payload=True,
                 score_threshold=None,
             )
+            print(f"[Hybrid Search] Sparse search returned {len(sparse_hits)} results")
+            if sparse_hits:
+                print(f"[Hybrid Search] Top sparse score: {sparse_hits[0].score:.4f}")
             
             # 3c) Format results
             def format_hits(hits, score_prefix=""):
@@ -1059,15 +1070,24 @@ async def search_documents(
                     })
                 return results
             
+            print(f"[Hybrid Search] Formatting dense results")
             dense_results = format_hits(dense_hits, "dense")
+            print(f"[Hybrid Search] Formatting sparse results")
             sparse_results = format_hits(sparse_hits, "sparse")
             
             # 3d) Apply RRF fusion
+            print(f"[Hybrid Search] Applying RRF fusion on {len(dense_results)} dense + {len(sparse_results)} sparse results")
             initial_results = reciprocal_rank_fusion(dense_results, sparse_results)
+            print(f"[Hybrid Search] RRF fusion produced {len(initial_results)} results")
+            if initial_results:
+                print(f"[Hybrid Search] Top RRF score: {initial_results[0].get('rrf_score', 0):.6f}")
+                print(f"[Hybrid Search] Top result: {initial_results[0].get('filename')} - {initial_results[0].get('title')}")
             
         except Exception as e:
             # Fallback to dense-only search if hybrid fails
-            print(f"Hybrid search failed, falling back to dense-only: {e}")
+            print(f"[Hybrid Search] ERROR: Hybrid search failed, falling back to dense-only: {e}")
+            import traceback
+            print(f"[Hybrid Search] Traceback: {traceback.format_exc()}")
             useHybrid = False
     
     # Fallback: dense-only search
