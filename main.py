@@ -1031,11 +1031,16 @@ async def search_documents(
             print(f"[Hybrid Search] Creating sparse vector from query")
             query_sparse_vec = create_sparse_vector(query)
             print(f"[Hybrid Search] Sparse vector has {len(query_sparse_vec.indices)} terms")
+            print(f"[Hybrid Search] Sparse vector indices: {query_sparse_vec.indices[:5]}...")
+            print(f"[Hybrid Search] Sparse vector values: {query_sparse_vec.values[:5]}...")
             
             print(f"[Hybrid Search] Starting sparse vector search with limit={search_limit}")
             sparse_hits = qdrant.search(
                 collection_name=table,
-                query_vector=("sparse", query_sparse_vec),
+                query_vector=qmodels.NamedSparseVector(
+                    name="sparse",
+                    vector=query_sparse_vec
+                ),
                 limit=search_limit,
                 with_payload=True,
                 score_threshold=None,
