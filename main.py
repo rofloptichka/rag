@@ -15,6 +15,8 @@ import cloudinary
 import cloudinary.uploader
 import cloudinary.api
 
+import meilisearch
+
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from docling.document_converter import DocumentConverter
@@ -62,7 +64,29 @@ qdrant: QdrantClient = QdrantClient(
     timeout=60
 )
 
+# --- Meilisearch ---
+MEILI_URL = os.getenv("MEILI_URL", "http://localhost:7700")
+MEILI_MASTER_KEY = os.getenv("MEILI_MASTER_KEY")
+MEILI_INDEX = os.getenv("MEILI_INDEX", "docs")
+
+meili = meilisearch.Client(MEILI_URL, MEILI_MASTER_KEY)
+
+def ensure_meili_index():
+    try:
+        meili.index(MEILI_INDEX).get_raw_info()
+    except Exception:
+        meili.create_index(uid=MEILI_INDEX, options={"primaryKey": "id"})
+        idx = meili.index(MEILI_INDEX)
+        idx.update_settings({
+            "searchableAttributes": ["text", "title"],
+            "filterableAttributes": ["company_id", "filename", "file_type", "lang", "index"],
+            "sortableAttributes": ["created_at"],
+        })
+
 app = FastAPI()
+
+# Initialize Meilisearch index
+ensure_meili_index()
 
 cloudinary.config(
   cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"),
@@ -450,9 +474,11 @@ def ensure_collection(name: str):
             pass
 
 def sha_id(*parts: str) -> int:
-    """Deterministic numeric ID for Qdrant (64-bit slice of SHA-256)."""
-    h = hashlib.sha256("::".join(parts).encode("utf-8")).hexdigest()
-    return int(h[:16], 16)
+    """Deterministic numeric ID for Qdrant (guaranteed within signed 64-bit range)."""
+    INT64_MAX = (1 << 63) - 1
+    h = hashlib.sha256("::".join(parts).encode("utf-8")).digest()
+    v = int.from_bytes(h[:8], byteorder="big", signed=False)  # 64-bit unsigned
+    return v & INT64_MAX  # Constrain to signed 64-bit range (0 to 2^63-1)
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     """Generate embeddings for a list of texts. Raises HTTPException on failure."""
@@ -473,6 +499,14 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
                 detail=f"Failed to generate embeddings: {error_msg}"
             )
 
+def stable_hash(text: str) -> int:
+    """Create a stable hash from text using SHA-1 with 63-bit range to minimize collisions."""
+    INT63_MAX = (1 << 63) - 1
+    hash_bytes = hashlib.sha1(text.encode('utf-8')).digest()
+    # Convert first 8 bytes to unsigned int, then constrain to 63-bit range
+    hash_int = int.from_bytes(hash_bytes[:8], byteorder='big', signed=False)
+    return hash_int & INT63_MAX  # Keep within positive 63-bit range for better distribution
+
 def create_sparse_vector(text: str) -> qmodels.SparseVector:
     """Create BM25-style sparse vector from text using simple term frequency."""
     # Simple tokenization: lowercase, remove punctuation, split by whitespace
@@ -484,12 +518,12 @@ def create_sparse_vector(text: str) -> qmodels.SparseVector:
         if len(token) > 2:  # Skip very short tokens
             term_freq[token] = term_freq.get(token, 0) + 1
     
-    # Convert to sparse vector format (index: hash of term, value: frequency)
+    # Convert to sparse vector format (index: stable hash of term, value: frequency)
     indices = []
     values = []
     for term, freq in term_freq.items():
-        # Use hash to create consistent numeric indices
-        index = hash(term) % (2**31)  # Keep within 32-bit int range
+        # Use stable hash to create consistent numeric indices across processes
+        index = stable_hash(term)
         indices.append(index)
         values.append(float(freq))
     
@@ -504,8 +538,8 @@ def reciprocal_rank_fusion(
     Combine dense and sparse search results using Reciprocal Rank Fusion (RRF).
     
     Args:
-        dense_results: Results from dense vector search
-        sparse_results: Results from sparse vector search
+        dense_results: Results from dense vector search (must include 'id' field)
+        sparse_results: Results from sparse vector search (must include 'id' field)
         k: RRF constant (default: 60)
     
     Returns:
@@ -517,28 +551,52 @@ def reciprocal_rank_fusion(
     
     # Process dense results
     for rank, doc in enumerate(dense_results, start=1):
-        doc_id = doc.get("filename", "") + doc.get("text", "")[:50]
+        doc_id = str(doc["id"])  # Use stable Qdrant point ID as string
         scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
-        doc_map[doc_id] = doc
+        doc_map.setdefault(doc_id, doc)
     
     # Process sparse results
     for rank, doc in enumerate(sparse_results, start=1):
-        doc_id = doc.get("filename", "") + doc.get("text", "")[:50]
+        doc_id = str(doc["id"])  # Use stable Qdrant point ID as string
         scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
-        if doc_id not in doc_map:
-            doc_map[doc_id] = doc
+        doc_map.setdefault(doc_id, doc)
     
-    # Sort by combined RRF score
-    sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    # Sort by combined RRF score and return with scores
+    return [
+        {**doc_map[doc_id], "rrf_score": score}
+        for doc_id, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    ]
+
+def meili_search(query: str, limit: int, company_id: str, extra_filters: list[str] | None = None):
+    """
+    Search using Meilisearch BM25 for keyword matching.
     
-    # Return documents in order with RRF scores
-    results = []
-    for doc_id, rrf_score in sorted_docs:
-        doc = doc_map[doc_id].copy()
-        doc["rrf_score"] = rrf_score
-        results.append(doc)
+    Args:
+        query: The search query
+        limit: Maximum number of results to return
+        company_id: Company ID to filter by
+        extra_filters: Optional additional filters (e.g., ['file_type = "sendable"'])
     
-    return results
+    Returns:
+        List of search results with id, text, filename, title, url, and score fields
+    """
+    idx = meili.index(MEILI_INDEX)
+    flt = [f'company_id = "{company_id}"']
+    if extra_filters:
+        flt.extend(extra_filters)
+    res = idx.search(query, {"limit": limit, "filter": flt})
+    hits = res.get("hits", [])
+    out = []
+    for h in hits:
+        out.append({
+            "id": str(h["id"]),
+            "text": h.get("text"),
+            "filename": h.get("filename"),
+            "title": h.get("title"),
+            "url": h.get("url"),
+            "score": 0.0  # RRF will use ranks, not these scores
+        })
+    return out
 
 # ------------------------------------------------------------------------------
 # Pydantic models for request bodies
@@ -784,6 +842,24 @@ async def process_document(
                 qdrant.upsert(collection_name=table, wait=True, points=points)
                 total_count = qdrant.count(collection_name=table, exact=False).count
                 
+                # ---------- MEILI: index chunks ----------
+                yield _sse_format("status", {"step": "meili_index", "message": "Indexing to Meilisearch"})
+                meili_docs = []
+                for i, item in enumerate(to_store):
+                    point_id = sha_id(companyId, safe_filename, str(i))
+                    meili_docs.append({
+                        "id": str(point_id),
+                        "company_id": companyId,
+                        "filename": safe_filename,
+                        "title": (item.get("metadata") or {}).get("title"),
+                        "text": item["text"],
+                        "url": (item.get("metadata") or {}).get("url"),
+                        "file_type": "document",
+                        "created_at": int(time.time())
+                    })
+                meili.index(MEILI_INDEX).add_documents(meili_docs, primary_key="id")
+                # ----------------------------------------
+                
                 yield _sse_format("done", {
                     "message": "Document processed and embeddings stored successfully.",
                     "row_count": int(total_count),
@@ -931,6 +1007,23 @@ async def process_document(
         qdrant.upsert(collection_name=table, wait=True, points=points)
         total_count = qdrant.count(collection_name=table, exact=False).count
         
+        # ---------- MEILI: index chunks ----------
+        meili_docs = []
+        for i, item in enumerate(to_store):
+            point_id = sha_id(companyId, safe_filename, str(i))
+            meili_docs.append({
+                "id": str(point_id),
+                "company_id": companyId,
+                "filename": safe_filename,
+                "title": (item.get("metadata") or {}).get("title"),
+                "text": item["text"],
+                "url": (item.get("metadata") or {}).get("url"),
+                "file_type": "document",
+                "created_at": int(time.time())
+            })
+        meili.index(MEILI_INDEX).add_documents(meili_docs, primary_key="id")
+        # ----------------------------------------
+        
         response_obj = {
             "message": "Document processed and embeddings stored successfully.",
             "row_count": int(total_count),
@@ -1027,27 +1120,10 @@ async def search_documents(
             if dense_hits:
                 print(f"[Hybrid Search] Top dense score: {dense_hits[0].score:.4f}")
             
-            # 3b) Sparse vector search (BM25-style)
-            print(f"[Hybrid Search] Creating sparse vector from query")
-            query_sparse_vec = create_sparse_vector(query)
-            print(f"[Hybrid Search] Sparse vector has {len(query_sparse_vec.indices)} terms")
-            print(f"[Hybrid Search] Sparse vector indices: {query_sparse_vec.indices[:5]}...")
-            print(f"[Hybrid Search] Sparse vector values: {query_sparse_vec.values[:5]}...")
-            
-            print(f"[Hybrid Search] Starting sparse vector search with limit={search_limit}")
-            sparse_hits = qdrant.search(
-                collection_name=table,
-                query_vector=qmodels.NamedSparseVector(
-                    name="sparse",
-                    vector=query_sparse_vec
-                ),
-                limit=search_limit,
-                with_payload=True,
-                score_threshold=None,
-            )
-            print(f"[Hybrid Search] Sparse search returned {len(sparse_hits)} results")
-            if sparse_hits:
-                print(f"[Hybrid Search] Top sparse score: {sparse_hits[0].score:.4f}")
+            # 3b) Meilisearch BM25 search (replaces sparse vector)
+            print(f"[Hybrid Search] Starting Meilisearch BM25 search with limit={search_limit}")
+            sparse_results = meili_search(query=query, limit=search_limit, company_id=companyId)
+            print(f"[Hybrid Search] Meilisearch returned {len(sparse_results)} results")
             
             # 3c) Format results
             def format_hits(hits, score_prefix=""):
@@ -1066,6 +1142,7 @@ async def search_documents(
                         page_numbers = pn_raw
 
                     results.append({
+                        "id":           str(hit.id),  # Keep true point ID as string for fusion
                         "text":         pl.get("text"),
                         "filename":     md.get("filename"),
                         "page_numbers": page_numbers,
@@ -1077,8 +1154,7 @@ async def search_documents(
             
             print(f"[Hybrid Search] Formatting dense results")
             dense_results = format_hits(dense_hits, "dense")
-            print(f"[Hybrid Search] Formatting sparse results")
-            sparse_results = format_hits(sparse_hits, "sparse")
+            # sparse_results already formatted by meili_search
             
             # 3d) Apply RRF fusion
             print(f"[Hybrid Search] Applying RRF fusion on {len(dense_results)} dense + {len(sparse_results)} sparse results")
@@ -1122,6 +1198,7 @@ async def search_documents(
                     page_numbers = pn_raw
 
                 initial_results.append({
+                    "id":           str(hit.id),  # Include Qdrant point ID as string
                     "text":         pl.get("text"),
                     "filename":     md.get("filename"),
                     "page_numbers": page_numbers,
@@ -1198,17 +1275,25 @@ async def delete_document(companyId: str, filename: str = Query(...)):
     # 1) Get the table
     table = get_company_doc_table(companyId)
 
-    # 2) Count matching records and delete from Qdrant
+    # 2) Count matching records before deletion
     filter_q = qmodels.Filter(
         must=[qmodels.FieldCondition(key="metadata.filename", match=qmodels.MatchValue(value=filename))]
     )
     
-    # Get count first
+    # Get count for response
     count_result = qdrant.count(collection_name=table, count_filter=filter_q, exact=True)
     deleted = count_result.count
 
     # 3) Delete from Qdrant
     qdrant.delete(collection_name=table, points_selector=qmodels.FilterSelector(filter=filter_q))
+
+    # 3.1) Delete from Meilisearch using filter (more efficient than ID-based deletion)
+    try:
+        meili.index(MEILI_INDEX).delete_documents(
+            filter=f'company_id = "{companyId}" AND filename = "{filename}"'
+        )
+    except Exception as e:
+        print(f"Warning: Meilisearch delete failed: {e}")
 
     # 4) Delete from GCS
     path = f"uploads/{companyId}/documents/{filename}"
@@ -1222,7 +1307,6 @@ async def delete_document(companyId: str, filename: str = Query(...)):
         "message": f"Deleted {deleted} chunks from Qdrant and attempted to remove file from GCS.",
         "rows_deleted": deleted
     }
-
 # ------------------------------------------------------------------------------
 #  GET /companies/{companyId}/download-document
 #    — вместо локальной выдачи возвращаем signed URL
@@ -1369,6 +1453,20 @@ async def process_sendable_file(
     )
     qdrant.upsert(collection_name=table, points=[point], wait=True)
 
+    # ---------- MEILI: index sendable ----------
+    meili.index(MEILI_INDEX).add_documents([{
+        "id": str(point.id),
+        "company_id": companyId,
+        "filename": safe_name,
+        "title": None,
+        "text": description,
+        "url": gcs_url,
+        "file_type": (file.content_type or os.path.splitext(safe_name)[1]),
+        "index": sendable_index,     # so you can filter/search by SF-123
+        "created_at": int(time.time())
+    }], primary_key="id")
+    # ------------------------------------------
+
     ### MODIFIED ###
     total_count = qdrant.count(collection_name=table, exact=False).count
     return {
@@ -1459,6 +1557,13 @@ async def update_sendable_description(
     )
     qdrant.upsert(collection_name=table, points=[updated_point], wait=True)
 
+    # ---------- MEILI: update sendable ----------
+    meili.index(MEILI_INDEX).add_documents([{
+        "id": str(point.id),
+        "text": new_description
+    }], primary_key="id")
+    # ------------------------------------------
+
     return {"message": f"Description for '{safe_name}' updated successfully."}
 
 @app.get("/companies/{companyId}/search-sendable")
@@ -1503,22 +1608,18 @@ async def search_sendable(
                 with_payload=True,
             )
             
-            # Sparse search
-            query_sparse_vec = create_sparse_vector(query)
-            sparse_hits = qdrant.search(
-                collection_name=table,
-                query_vector=("sparse", query_sparse_vec),
-                limit=limit * 2,
-                with_payload=True,
-            )
+            # Meilisearch BM25 search (replaces sparse)
+            sparse_results = meili_search(query=query, limit=limit*2, company_id=companyId,
+                                          extra_filters=['file_type != "document"'])  # optional filter for sendables
             
-            # Format results
+            # Format dense results
             def format_sendable_hits(hits):
                 formatted = []
                 for hit in hits:
                     pl = hit.payload or {}
                     md = pl.get("metadata", {})
                     formatted.append({
+                        "id":        str(hit.id),  # Include Qdrant point ID as string for RRF
                         "index":     md.get("index"),
                         "text":      pl.get("text"),
                         "filename":  md.get("filename"),
@@ -1530,7 +1631,7 @@ async def search_sendable(
                 return formatted
             
             dense_results = format_sendable_hits(dense_hits)
-            sparse_results = format_sendable_hits(sparse_hits)
+            # sparse_results already formatted by meili_search
             
             # Apply RRF fusion
             fused = reciprocal_rank_fusion(dense_results, sparse_results)
@@ -1553,6 +1654,7 @@ async def search_sendable(
             pl = hit.payload or {}
             md = pl.get("metadata", {})
             results.append({
+                "id":        str(hit.id),  # Include Qdrant point ID as string
                 "index":     md.get("index"),
                 "text":      pl.get("text"),
                 "filename":  md.get("filename"),
@@ -1642,11 +1744,13 @@ async def delete_sendable(
             must=[qmodels.FieldCondition(key="metadata.filename", match=qmodels.MatchValue(value=safe_name))]
         )
         identifier = f"filename '{safe_name}'"
+        meili_filter = f'company_id = "{companyId}" AND filename = "{safe_name}"'
     else: # We know index is not None here because of the validation above
         filter_q = qmodels.Filter(
             must=[qmodels.FieldCondition(key="metadata.index", match=qmodels.MatchValue(value=index))]
         )
         identifier = f"index '{index}'"
+        meili_filter = f'company_id = "{companyId}" AND index = "{index}"'
 
     # 2) Find the record(s) to delete *before* deleting from the DB
     # We need the metadata to clean up GCS and Cloudinary
@@ -1690,6 +1794,12 @@ async def delete_sendable(
 
     # 4) Delete from Qdrant (now that cloud assets are gone)
     qdrant.delete(collection_name=table, points_selector=qmodels.FilterSelector(filter=filter_q))
+
+    # 4.1) Delete from Meilisearch using filter (more efficient than ID-based deletion)
+    try:
+        meili.index(MEILI_INDEX).delete_documents(filter=meili_filter)
+    except Exception as e:
+        print(f"Warning: Meilisearch delete failed: {e}")
 
     return {
         "message": f"Successfully deleted {deleted_count} record(s) and associated files for {identifier}.",
