@@ -831,8 +831,8 @@ async def process_document(
                     }
                     
                     points.append(qmodels.PointStruct(
-                        id=point_id, 
-                        vector={
+                        id=point_id,
+                        vectors={
                             "dense": dense_vec,
                             "sparse": sparse_vec
                         },
@@ -996,8 +996,8 @@ async def process_document(
             }
             
             points.append(qmodels.PointStruct(
-                id=point_id, 
-                vector={
+                id=point_id,
+                vectors={
                     "dense": dense_vec,
                     "sparse": sparse_vec
                 },
@@ -1444,8 +1444,8 @@ async def process_sendable_file(
     
     point_id = sha_id(companyId, "sendable", safe_name)
     point = qmodels.PointStruct(
-        id=point_id, 
-        vector={
+        id=point_id,
+        vectors={
             "dense": dense_embedding,
             "sparse": sparse_embedding
         },
@@ -1548,8 +1548,8 @@ async def update_sendable_description(
     new_sparse_embedding = create_sparse_vector(new_description)
     
     updated_point = qmodels.PointStruct(
-        id=point.id, 
-        vector={
+        id=point.id,
+        vectors={
             "dense": new_dense_embedding,
             "sparse": new_sparse_embedding
         },
