@@ -830,12 +830,16 @@ async def process_document(
                         "metadata": item["metadata"]
                     }
                     
+                    # Use named vectors - dense as list, sparse as NamedSparseVector
                     points.append(qmodels.PointStruct(
                         id=point_id,
-                        vectors={
-                            "dense": dense_vec,
-                            "sparse": sparse_vec
-                        },
+                        vector=qmodels.NamedVectors(
+                            dense=dense_vec,
+                            sparse=qmodels.NamedSparseVector(
+                                name="sparse",
+                                vector=sparse_vec
+                            )
+                        ),
                         payload=payload
                     ))
                 
@@ -995,12 +999,16 @@ async def process_document(
                 "metadata": item["metadata"]
             }
             
+            # Use named vectors - dense as list, sparse as NamedSparseVector
             points.append(qmodels.PointStruct(
                 id=point_id,
-                vectors={
-                    "dense": dense_vec,
-                    "sparse": sparse_vec
-                },
+                vector=qmodels.NamedVectors(
+                    dense=dense_vec,
+                    sparse=qmodels.NamedSparseVector(
+                        name="sparse",
+                        vector=sparse_vec
+                    )
+                ),
                 payload=payload
             ))
         
@@ -1443,12 +1451,16 @@ async def process_sendable_file(
     sparse_embedding = create_sparse_vector(description)
     
     point_id = sha_id(companyId, "sendable", safe_name)
+    # Use named vectors - dense as list, sparse as NamedSparseVector
     point = qmodels.PointStruct(
         id=point_id,
-        vectors={
-            "dense": dense_embedding,
-            "sparse": sparse_embedding
-        },
+        vector=qmodels.NamedVectors(
+            dense=dense_embedding,
+            sparse=qmodels.NamedSparseVector(
+                name="sparse",
+                vector=sparse_embedding
+            )
+        ),
         payload=payload
     )
     qdrant.upsert(collection_name=table, points=[point], wait=True)
@@ -1547,12 +1559,16 @@ async def update_sendable_description(
     # Create new sparse vector
     new_sparse_embedding = create_sparse_vector(new_description)
     
+    # Use named vectors - dense as list, sparse as NamedSparseVector
     updated_point = qmodels.PointStruct(
         id=point.id,
-        vectors={
-            "dense": new_dense_embedding,
-            "sparse": new_sparse_embedding
-        },
+        vector=qmodels.NamedVectors(
+            dense=new_dense_embedding,
+            sparse=qmodels.NamedSparseVector(
+                name="sparse",
+                vector=new_sparse_embedding
+            )
+        ),
         payload=payload
     )
     qdrant.upsert(collection_name=table, points=[updated_point], wait=True)
