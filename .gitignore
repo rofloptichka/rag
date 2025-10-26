@@ -1,8 +1,8 @@
 .env
-
+deprecated_main.py
 /__pycache__
 /utils/__pycache__
-
+/routers/__pycache__
 /data
 
 /uploads
@@ -12,3 +12,8 @@ FILTER_BASED_DELETION.md
 HYBRID_SEARCH_CHANGES.md
 MEILISEARCH_INTEGRATION.md
 QUICKSTART_MEILISEARCH.md
+BM25_REDIS_INTEGRATION.md
+example_bm25_redis_integration.py
+example_bm25_usage.py
+
+init

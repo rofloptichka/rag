@@ -12,3 +12,4 @@ requests
 google-cloud-storage
 cloudinary
 regex
+redis
