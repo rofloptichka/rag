@@ -32,6 +32,8 @@ from google.cloud import storage
 from typing import List, Optional, Dict, Any, Tuple
 import time
 import logging
+from collections import OrderedDict
+import asyncio
 
 load_dotenv()
 
@@ -46,6 +48,9 @@ converter = DocumentConverter()
 # OpenAI embedding configuration
 EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")
 EMBED_DIMS = int(os.getenv("OPENAI_EMBED_DIMS", "3072"))
+# Short-timeout OpenAI client for latency-sensitive calls
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "15"))
+client_fast = client.with_options(timeout=OPENAI_TIMEOUT)
 
 b64_key = os.environ["GOOGLE_CLOUD_KEY"]
 decoded = base64.b64decode(b64_key)
@@ -60,7 +65,7 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 qdrant: QdrantClient = QdrantClient(
     url=QDRANT_URL, 
     api_key=QDRANT_API_KEY,
-    prefer_grpc=False,
+    prefer_grpc=True,
     timeout=60
 )
 
@@ -484,7 +489,7 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     """Generate embeddings for a list of texts. Raises HTTPException on failure."""
     try:
         # Batch embeddings to reduce overhead; OpenAI supports batching via list input
-        resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
+        resp = client_fast.embeddings.create(model=EMBED_MODEL, input=texts)
         return [d.embedding for d in resp.data]
     except Exception as e:
         error_msg = str(e)
@@ -566,6 +571,29 @@ def reciprocal_rank_fusion(
         {**doc_map[doc_id], "rrf_score": score}
         for doc_id, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)
     ]
+
+# ------------------------------------------------------------------------------
+# Small in-memory LRU cache for query embeddings (speeds up repeated searches)
+# ------------------------------------------------------------------------------
+_EMB_CACHE_MAX = int(os.getenv("QUERY_EMBED_CACHE_SIZE", "200"))
+_emb_cache: "OrderedDict[str, List[float]]" = OrderedDict()
+
+def get_cached_query_embedding(query: str) -> List[float]:
+    key = query.strip()
+    if not key:
+        return []
+    vec = _emb_cache.get(key)
+    if vec is not None:
+        # move to end (recently used)
+        _emb_cache.move_to_end(key)
+        return vec
+    # compute and cache
+    emb_resp = client_fast.embeddings.create(model=EMBED_MODEL, input=key)
+    vec = emb_resp.data[0].embedding
+    _emb_cache[key] = vec
+    if len(_emb_cache) > _EMB_CACHE_MAX:
+        _emb_cache.popitem(last=False)
+    return vec
 
 def meili_search(query: str, limit: int, company_id: str, extra_filters: list[str] | None = None):
     """
@@ -817,31 +845,25 @@ async def process_document(
                 # Generate dense vectors
                 dense_vectors = embed_texts(embed_inputs)
                 
-                # Build points with both dense and sparse vectors
+                # Build points with dense vectors only (sparse handled by Meilisearch)
                 points = []
                 for i, (item, dense_vec) in enumerate(zip(to_store, dense_vectors)):
                     point_id = sha_id(companyId, safe_filename, str(i))
-                    
-                    # Create sparse vector from text
-                    sparse_vec = create_sparse_vector(item["text"])
                     
                     payload = {
                         "text": item["text"],
                         "metadata": item["metadata"]
                     }
                     
-                    # Use named vectors - dense as list, sparse as NamedSparseVector
-                    points.append(qmodels.PointStruct(
-                        id=point_id,
-                        vector=qmodels.NamedVectors(
-                            dense=dense_vec,
-                            sparse=qmodels.NamedSparseVector(
-                                name="sparse",
-                                vector=sparse_vec
-                            )
-                        ),
-                        payload=payload
-                    ))
+                    # Build point with named dense vector
+                    point = {
+                        "id": point_id,
+                        "vector": {
+                            "dense": dense_vec
+                        },
+                        "payload": payload
+                    }
+                    points.append(point)
                 
                 qdrant.upsert(collection_name=table, wait=True, points=points)
                 total_count = qdrant.count(collection_name=table, exact=False).count
@@ -986,31 +1008,25 @@ async def process_document(
         # Generate dense vectors
         dense_vectors = embed_texts(embed_inputs)
         
-        # Build points with both dense and sparse vectors
+        # Build points with dense vectors only (sparse handled by Meilisearch)
         points = []
         for i, (item, dense_vec) in enumerate(zip(to_store, dense_vectors)):
             point_id = sha_id(companyId, safe_filename, str(i))
-            
-            # Create sparse vector from text
-            sparse_vec = create_sparse_vector(item["text"])
             
             payload = {
                 "text": item["text"],
                 "metadata": item["metadata"]
             }
             
-            # Use named vectors - dense as list, sparse as NamedSparseVector
-            points.append(qmodels.PointStruct(
-                id=point_id,
-                vector=qmodels.NamedVectors(
-                    dense=dense_vec,
-                    sparse=qmodels.NamedSparseVector(
-                        name="sparse",
-                        vector=sparse_vec
-                    )
-                ),
-                payload=payload
-            ))
+            # Build point with named dense vector
+            point = {
+                "id": point_id,
+                "vector": {
+                    "dense": dense_vec
+                },
+                "payload": payload
+            }
+            points.append(point)
         
         qdrant.upsert(collection_name=table, wait=True, points=points)
         total_count = qdrant.count(collection_name=table, exact=False).count
@@ -1070,14 +1086,12 @@ async def search_documents(
     Returns matching chunks with their metadata and relevance scores.
     """
     table = get_company_doc_table(companyId)
-
     # 1) Get dense embedding for the query
     try:
-        emb_resp = client.embeddings.create(
-            model="text-embedding-3-large",
-            input=query
-        )
-        query_dense_vec = emb_resp.data[0].embedding
+        # Use cache for repeated queries to reduce TTFB
+        t0 = time.perf_counter()
+        query_dense_vec = get_cached_query_embedding(query)
+        print(f"[Search] Query embedding in {(time.perf_counter()-t0)*1000:.1f} ms (cached={'yes' if query in _emb_cache else 'no'})")
     except Exception as e:
         error_msg = str(e)
         if "429" in error_msg or "rate_limit" in error_msg.lower():
@@ -1115,23 +1129,28 @@ async def search_documents(
     
     if useHybrid:
         try:
-            # 3a) Dense vector search
-            print(f"[Hybrid Search] Starting dense vector search with limit={search_limit}")
-            dense_hits = qdrant.search(
-                collection_name=table,
-                query_vector=("dense", query_dense_vec),
-                limit=search_limit,
-                with_payload=True,
-                score_threshold=None,
-            )
-            print(f"[Hybrid Search] Dense search returned {len(dense_hits)} results")
-            if dense_hits:
-                print(f"[Hybrid Search] Top dense score: {dense_hits[0].score:.4f}")
+            t0 = time.perf_counter()
+            print(f"[Hybrid Search] Parallel dense + meili, limit={search_limit}")
             
-            # 3b) Meilisearch BM25 search (replaces sparse vector)
-            print(f"[Hybrid Search] Starting Meilisearch BM25 search with limit={search_limit}")
-            sparse_results = meili_search(query=query, limit=search_limit, company_id=companyId)
-            print(f"[Hybrid Search] Meilisearch returned {len(sparse_results)} results")
+            async def _dense_job():
+                return await asyncio.to_thread(
+                    qdrant.search,
+                    collection_name=table,
+                    query_vector=("dense", query_dense_vec),
+                    limit=search_limit,
+                    with_payload=True,
+                    score_threshold=None,
+                )
+            async def _sparse_job():
+                return await asyncio.to_thread(
+                    meili_search,
+                    query,
+                    search_limit,
+                    companyId,
+                )
+            dense_hits, sparse_results = await asyncio.gather(_dense_job(), _sparse_job())
+            t1 = time.perf_counter()
+            print(f"[Hybrid Search] Dense={len(dense_hits)} Meili={len(sparse_results)} in {(t1-t0)*1000:.1f} ms")
             
             # 3c) Format results
             def format_hits(hits, score_prefix=""):
@@ -1182,6 +1201,7 @@ async def search_documents(
     # Fallback: dense-only search
     if not useHybrid:
         try:
+            t0 = time.perf_counter()
             hits = qdrant.search(
                 collection_name=table,
                 query_vector=("dense", query_dense_vec),
@@ -1189,6 +1209,7 @@ async def search_documents(
                 with_payload=True,
                 score_threshold=None,
             )
+            print(f"[Dense-only Search] Qdrant returned {len(hits)} in {(time.perf_counter()-t0)*1000:.1f} ms")
             
             # Format dense-only results
             initial_results = []
@@ -1220,11 +1241,10 @@ async def search_documents(
     # 4) Apply reranking if enabled
     final_results = initial_results
     rerank_metadata = {"reranked": False, "hybrid": useHybrid}
-    
+
     if rerank_enabled and len(initial_results) > 1:
-        import time
         start_time = time.time()
-        
+
         try:
             if use_openai:
                 reranked_results = rerank_with_openai(
@@ -1414,8 +1434,8 @@ async def process_sendable_file(
 
     # 3) Generate embedding for the description
     try:
-        emb_resp = client.embeddings.create(
-            model="text-embedding-3-large",
+        emb_resp = client_fast.embeddings.create(
+            model=EMBED_MODEL,
             input=description
         )
         dense_embedding = emb_resp.data[0].embedding
@@ -1432,7 +1452,7 @@ async def process_sendable_file(
                 detail=f"Failed to generate embedding: {error_msg}"
             )
 
-    # 4) Prepare record and save to Qdrant with dense and sparse vectors
+    # 4) Prepare record and save to Qdrant with dense vectors only (sparse handled by Meilisearch)
     metadata = {
         "index": sendable_index,
         "file_type": (file.content_type or os.path.splitext(safe_name)[1]),
@@ -1447,27 +1467,20 @@ async def process_sendable_file(
         "metadata": metadata
     }
     
-    # Create sparse vector from description
-    sparse_embedding = create_sparse_vector(description)
-    
     point_id = sha_id(companyId, "sendable", safe_name)
-    # Use named vectors - dense as list, sparse as NamedSparseVector
-    point = qmodels.PointStruct(
-        id=point_id,
-        vector=qmodels.NamedVectors(
-            dense=dense_embedding,
-            sparse=qmodels.NamedSparseVector(
-                name="sparse",
-                vector=sparse_embedding
-            )
-        ),
-        payload=payload
-    )
+    # Build point with named dense vector
+    point = {
+        "id": point_id,
+        "vector": {
+            "dense": dense_embedding
+        },
+        "payload": payload
+    }
     qdrant.upsert(collection_name=table, points=[point], wait=True)
 
     # ---------- MEILI: index sendable ----------
     meili.index(MEILI_INDEX).add_documents([{
-        "id": str(point.id),
+        "id": str(point_id),
         "company_id": companyId,
         "filename": safe_name,
         "title": None,
@@ -1533,8 +1546,8 @@ async def update_sendable_description(
 
     # 2) Recalculate embeddings for the new description
     try:
-        emb_resp = client.embeddings.create(
-            model="text-embedding-3-large",
+        emb_resp = client_fast.embeddings.create(
+            model=EMBED_MODEL,
             input=new_description
         )
         new_dense_embedding = emb_resp.data[0].embedding
@@ -1551,26 +1564,19 @@ async def update_sendable_description(
                 detail=f"Failed to generate embedding: {error_msg}"
             )
 
-    # 3) Update with new description and vectors (dense + sparse)
+    # 3) Update with new description and dense vectors only
     point = found_records[0]
     payload = point.payload or {}
     payload["text"] = new_description
     
-    # Create new sparse vector
-    new_sparse_embedding = create_sparse_vector(new_description)
-    
-    # Use named vectors - dense as list, sparse as NamedSparseVector
-    updated_point = qmodels.PointStruct(
-        id=point.id,
-        vector=qmodels.NamedVectors(
-            dense=new_dense_embedding,
-            sparse=qmodels.NamedSparseVector(
-                name="sparse",
-                vector=new_sparse_embedding
-            )
-        ),
-        payload=payload
-    )
+    # Build point with named dense vector
+    updated_point = {
+        "id": point.id,
+        "vector": {
+            "dense": new_dense_embedding
+        },
+        "payload": payload
+    }
     qdrant.upsert(collection_name=table, points=[updated_point], wait=True)
 
     # ---------- MEILI: update sendable ----------
