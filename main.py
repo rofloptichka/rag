@@ -1,5 +1,6 @@
 import os
-import re
+import re  # Standard regex for general pattern matching
+import regex  # For Unicode-aware tokenization (multilingual support)
 import io
 import json
 import base64
@@ -15,7 +16,7 @@ import cloudinary
 import cloudinary.uploader
 import cloudinary.api
 
-import meilisearch
+# Meilisearch removed: switching to Qdrant-only (dense + sparse)
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
@@ -36,6 +37,12 @@ from collections import OrderedDict
 import asyncio
 
 load_dotenv()
+
+# ------------------------------------------------------------------------------
+# Logging setup
+# ------------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------------------
 # Глобальные настройки
@@ -69,29 +76,8 @@ qdrant: QdrantClient = QdrantClient(
     timeout=60
 )
 
-# --- Meilisearch ---
-MEILI_URL = os.getenv("MEILI_URL", "http://localhost:7700")
-MEILI_MASTER_KEY = os.getenv("MEILI_MASTER_KEY")
-MEILI_INDEX = os.getenv("MEILI_INDEX", "docs")
-
-meili = meilisearch.Client(MEILI_URL, MEILI_MASTER_KEY)
-
-def ensure_meili_index():
-    try:
-        meili.index(MEILI_INDEX).get_raw_info()
-    except Exception:
-        meili.create_index(uid=MEILI_INDEX, options={"primaryKey": "id"})
-        idx = meili.index(MEILI_INDEX)
-        idx.update_settings({
-            "searchableAttributes": ["text", "title"],
-            "filterableAttributes": ["company_id", "filename", "file_type", "lang", "index"],
-            "sortableAttributes": ["created_at"],
-        })
 
 app = FastAPI()
-
-# Initialize Meilisearch index
-ensure_meili_index()
 
 cloudinary.config(
   cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"),
@@ -505,23 +491,30 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
             )
 
 def stable_hash(text: str) -> int:
-    """Create a stable hash from text using SHA-1 with 63-bit range to minimize collisions."""
-    INT63_MAX = (1 << 63) - 1
+    """Create a stable 32-bit unsigned hash from text (suitable for Qdrant sparse indices)."""
+    # Qdrant sparse vector indices are uint32; keep within [0, 2^32-1]
+    UINT32_MAX = (1 << 32) - 1
     hash_bytes = hashlib.sha1(text.encode('utf-8')).digest()
-    # Convert first 8 bytes to unsigned int, then constrain to 63-bit range
-    hash_int = int.from_bytes(hash_bytes[:8], byteorder='big', signed=False)
-    return hash_int & INT63_MAX  # Keep within positive 63-bit range for better distribution
+    # Use first 4 bytes for 32-bit range
+    hash_int = int.from_bytes(hash_bytes[:4], byteorder='big', signed=False)
+    return hash_int & UINT32_MAX
 
 def create_sparse_vector(text: str) -> qmodels.SparseVector:
-    """Create BM25-style sparse vector from text using simple term frequency."""
-    # Simple tokenization: lowercase, remove punctuation, split by whitespace
-    tokens = re.findall(r'\b\w+\b', text.lower())
+    """
+    Create BM25-style sparse vector from text using Unicode-aware tokenization.
+    Supports all languages including Cyrillic, CJK, Arabic, etc.
+    """
+    # \p{L} = any Unicode letter (Latin, Cyrillic, CJK, Arabic, etc.)
+    # \p{N} = any Unicode number (digits in any script)
+    tokens = regex.findall(r'[\p{L}\p{N}]+', text.lower())
+    
+    # Filter out very short tokens (optional, but recommended)
+    tokens = [t for t in tokens if len(t) >= 2]
     
     # Count term frequencies
     term_freq: Dict[str, int] = {}
     for token in tokens:
-        if len(token) > 2:  # Skip very short tokens
-            term_freq[token] = term_freq.get(token, 0) + 1
+        term_freq[token] = term_freq.get(token, 0) + 1
     
     # Convert to sparse vector format (index: stable hash of term, value: frequency)
     indices = []
@@ -595,36 +588,42 @@ def get_cached_query_embedding(query: str) -> List[float]:
         _emb_cache.popitem(last=False)
     return vec
 
-def meili_search(query: str, limit: int, company_id: str, extra_filters: list[str] | None = None):
+def qdrant_sparse_search(table: str, query: str, limit: int) -> List[Dict[str, Any]]:
     """
-    Search using Meilisearch BM25 for keyword matching.
-    
-    Args:
-        query: The search query
-        limit: Maximum number of results to return
-        company_id: Company ID to filter by
-        extra_filters: Optional additional filters (e.g., ['file_type = "sendable"'])
-    
-    Returns:
-        List of search results with id, text, filename, title, url, and score fields
+    Sparse keyword-style search using Qdrant sparse vectors.
+    Returns formatted results compatible with dense results for RRF.
     """
-    idx = meili.index(MEILI_INDEX)
-    flt = [f'company_id = "{company_id}"']
-    if extra_filters:
-        flt.extend(extra_filters)
-    res = idx.search(query, {"limit": limit, "filter": flt})
-    hits = res.get("hits", [])
-    out = []
-    for h in hits:
-        out.append({
-            "id": str(h["id"]),
-            "text": h.get("text"),
-            "filename": h.get("filename"),
-            "title": h.get("title"),
-            "url": h.get("url"),
-            "score": 0.0  # RRF will use ranks, not these scores
+    sparse_vec = create_sparse_vector(query)
+    hits = qdrant.search(
+        collection_name=table,
+        query_vector=("sparse", sparse_vec),
+        limit=limit,
+        with_payload=True,
+    )
+    results: List[Dict[str, Any]] = []
+    for hit in hits:
+        pl = hit.payload or {}
+        md = pl.get("metadata", {})
+        pn_raw = md.get("page_numbers")
+        page_numbers = None
+        if isinstance(pn_raw, str):
+            try:
+                page_numbers = json.loads(pn_raw)
+            except Exception:
+                page_numbers = None
+        elif isinstance(pn_raw, list):
+            page_numbers = pn_raw
+
+        results.append({
+            "id":           str(hit.id),
+            "text":         pl.get("text"),
+            "filename":     md.get("filename"),
+            "page_numbers": page_numbers,
+            "title":        md.get("title"),
+            "url":          md.get("url"),
+            "score":        float(hit.score) if hit.score is not None else 0.0,
         })
-    return out
+    return results
 
 # ------------------------------------------------------------------------------
 # Pydantic models for request bodies
@@ -809,6 +808,7 @@ async def process_document(
                             },
                         }
                         to_store.append(item)
+                        logger.info(f"Indexing chunk {i}: title='{item['metadata']['title']}', text_preview='{item['text'][:100]}...'")
                         yield _sse_format("chunk", {"index": i, "title": item["metadata"]["title"], "preview": item["text"][:160]})
                 else:
                     for i, chunk in enumerate(chunks):
@@ -824,6 +824,7 @@ async def process_document(
                             },
                         }
                         to_store.append(item)
+                        logger.info(f"Indexing chunk {i}: title='{item['metadata']['title']}', text_preview='{item['text'][:100]}...'")
                         yield _sse_format("chunk", {"index": i, "title": item["metadata"]["title"], "preview": item["text"][:160], "pages": page_nums})
 
                 if not to_store:
@@ -845,7 +846,7 @@ async def process_document(
                 # Generate dense vectors
                 dense_vectors = embed_texts(embed_inputs)
                 
-                # Build points with dense vectors only (sparse handled by Meilisearch)
+                # Build points with both dense and sparse vectors (Qdrant-only)
                 points = []
                 for i, (item, dense_vec) in enumerate(zip(to_store, dense_vectors)):
                     point_id = sha_id(companyId, safe_filename, str(i))
@@ -855,36 +856,30 @@ async def process_document(
                         "metadata": item["metadata"]
                     }
                     
-                    # Build point with named dense vector
-                    point = {
-                        "id": point_id,
-                        "vector": {
-                            "dense": dense_vec
+                    # Build point with named dense and sparse vectors
+                    title = (item.get("metadata") or {}).get("title")
+                    sparse_source = f"{title}. {item['text']}" if title else item["text"]
+                    sparse_vec = create_sparse_vector(sparse_source)
+                    # Log tokens being indexed
+                    tokens = regex.findall(r'[\p{L}\p{N}]+', sparse_source.lower())
+                    tokens = [t for t in tokens if len(t) >= 2]
+                    logger.info(f"Tokens for chunk {i}: {tokens[:20]}{'...' if len(tokens) > 20 else ''} (total {len(tokens)} tokens)")
+                    # IMPORTANT: Pass both dense and sparse vectors in the vector parameter
+                    point = qmodels.PointStruct(
+                        id=point_id,
+                        vector={
+                            "dense": dense_vec,
+                            "sparse": qmodels.SparseVector(
+                                indices=sparse_vec.indices,
+                                values=sparse_vec.values
+                            )
                         },
-                        "payload": payload
-                    }
+                        payload=payload
+                    )
                     points.append(point)
                 
                 qdrant.upsert(collection_name=table, wait=True, points=points)
                 total_count = qdrant.count(collection_name=table, exact=False).count
-                
-                # ---------- MEILI: index chunks ----------
-                yield _sse_format("status", {"step": "meili_index", "message": "Indexing to Meilisearch"})
-                meili_docs = []
-                for i, item in enumerate(to_store):
-                    point_id = sha_id(companyId, safe_filename, str(i))
-                    meili_docs.append({
-                        "id": str(point_id),
-                        "company_id": companyId,
-                        "filename": safe_filename,
-                        "title": (item.get("metadata") or {}).get("title"),
-                        "text": item["text"],
-                        "url": (item.get("metadata") or {}).get("url"),
-                        "file_type": "document",
-                        "created_at": int(time.time())
-                    })
-                meili.index(MEILI_INDEX).add_documents(meili_docs, primary_key="id")
-                # ----------------------------------------
                 
                 yield _sse_format("done", {
                     "message": "Document processed and embeddings stored successfully.",
@@ -969,6 +964,7 @@ async def process_document(
                     },
                 }
                 to_store.append(item)
+                logger.info(f"Indexing chunk {i}: title='{item['metadata']['title']}', text_preview='{item['text'][:100]}...'")
                 try:
                     print({"chunk_index": i, "title": item["metadata"]["title"], "preview": item["text"][:160]})
                 except Exception:
@@ -987,6 +983,7 @@ async def process_document(
                     },
                 }
                 to_store.append(item)
+                logger.info(f"Indexing chunk {i}: title='{item['metadata']['title']}', text_preview='{item['text'][:100]}...'")
                 try:
                     print({"chunk_index": i, "title": item["metadata"]["title"], "preview": item["text"][:160], "pages": page_nums})
                 except Exception:
@@ -1008,7 +1005,7 @@ async def process_document(
         # Generate dense vectors
         dense_vectors = embed_texts(embed_inputs)
         
-        # Build points with dense vectors only (sparse handled by Meilisearch)
+        # Build points with both dense and sparse vectors (Qdrant-only)
         points = []
         for i, (item, dense_vec) in enumerate(zip(to_store, dense_vectors)):
             point_id = sha_id(companyId, safe_filename, str(i))
@@ -1018,35 +1015,30 @@ async def process_document(
                 "metadata": item["metadata"]
             }
             
-            # Build point with named dense vector
-            point = {
-                "id": point_id,
-                "vector": {
-                    "dense": dense_vec
+            # Build point with named dense and sparse vectors
+            title = (item.get("metadata") or {}).get("title")
+            sparse_source = f"{title}. {item['text']}" if title else item["text"]
+            sparse_vec = create_sparse_vector(sparse_source)
+            # Log tokens being indexed
+            tokens = regex.findall(r'[\p{L}\p{N}]+', sparse_source.lower())
+            tokens = [t for t in tokens if len(t) >= 2]
+            logger.info(f"Tokens for chunk {i}: {tokens[:20]}{'...' if len(tokens) > 20 else ''} (total {len(tokens)} tokens)")
+            # IMPORTANT: Pass both dense and sparse vectors in the vector parameter
+            point = qmodels.PointStruct(
+                id=point_id,
+                vector={
+                    "dense": dense_vec,
+                    "sparse": qmodels.SparseVector(
+                        indices=sparse_vec.indices,
+                        values=sparse_vec.values
+                    )
                 },
-                "payload": payload
-            }
+                payload=payload
+            )
             points.append(point)
         
         qdrant.upsert(collection_name=table, wait=True, points=points)
         total_count = qdrant.count(collection_name=table, exact=False).count
-        
-        # ---------- MEILI: index chunks ----------
-        meili_docs = []
-        for i, item in enumerate(to_store):
-            point_id = sha_id(companyId, safe_filename, str(i))
-            meili_docs.append({
-                "id": str(point_id),
-                "company_id": companyId,
-                "filename": safe_filename,
-                "title": (item.get("metadata") or {}).get("title"),
-                "text": item["text"],
-                "url": (item.get("metadata") or {}).get("url"),
-                "file_type": "document",
-                "created_at": int(time.time())
-            })
-        meili.index(MEILI_INDEX).add_documents(meili_docs, primary_key="id")
-        # ----------------------------------------
         
         response_obj = {
             "message": "Document processed and embeddings stored successfully.",
@@ -1091,6 +1083,7 @@ async def search_documents(
         # Use cache for repeated queries to reduce TTFB
         t0 = time.perf_counter()
         query_dense_vec = get_cached_query_embedding(query)
+        logger.info(f"Query processed: '{query}' -> dense embedding generated in {(time.perf_counter()-t0)*1000:.1f} ms")
         print(f"[Search] Query embedding in {(time.perf_counter()-t0)*1000:.1f} ms (cached={'yes' if query in _emb_cache else 'no'})")
     except Exception as e:
         error_msg = str(e)
@@ -1129,28 +1122,39 @@ async def search_documents(
     
     if useHybrid:
         try:
+            # Log query sparse vector creation
+            query_sparse_vec = create_sparse_vector(query)
+            query_tokens = regex.findall(r'[\p{L}\p{N}]+', query.lower())
+            query_tokens = [t for t in query_tokens if len(t) >= 2]
+            logger.info(f"Query sparse vector: tokens={query_tokens[:20]}{'...' if len(query_tokens) > 20 else ''} (total {len(query_tokens)}), indices={query_sparse_vec.indices[:10]}{'...' if len(query_sparse_vec.indices) > 10 else ''}")
+            
             t0 = time.perf_counter()
-            print(f"[Hybrid Search] Parallel dense + meili, limit={search_limit}")
+            print(f"[Hybrid Search] Parallel dense + sparse (Qdrant), limit={search_limit}")
             
             async def _dense_job():
                 return await asyncio.to_thread(
-                    qdrant.search,
+                    qdrant.query_points,
                     collection_name=table,
-                    query_vector=("dense", query_dense_vec),
+                    query=query_dense_vec,
+                    using="dense",
                     limit=search_limit,
                     with_payload=True,
                     score_threshold=None,
                 )
             async def _sparse_job():
                 return await asyncio.to_thread(
-                    meili_search,
-                    query,
-                    search_limit,
-                    companyId,
+                    qdrant.query_points,
+                    collection_name=table,
+                    query=query_sparse_vec,
+                    using="sparse",
+                    limit=search_limit,
+                    with_payload=True,
                 )
-            dense_hits, sparse_results = await asyncio.gather(_dense_job(), _sparse_job())
+            dense_result, sparse_result = await asyncio.gather(_dense_job(), _sparse_job())
+            dense_hits = dense_result.points
+            sparse_hits = sparse_result.points
             t1 = time.perf_counter()
-            print(f"[Hybrid Search] Dense={len(dense_hits)} Meili={len(sparse_results)} in {(t1-t0)*1000:.1f} ms")
+            print(f"[Hybrid Search] Dense={len(dense_hits)} Sparse={len(sparse_hits)} in {(t1-t0)*1000:.1f} ms")
             
             # 3c) Format results
             def format_hits(hits, score_prefix=""):
@@ -1181,7 +1185,28 @@ async def search_documents(
             
             print(f"[Hybrid Search] Formatting dense results")
             dense_results = format_hits(dense_hits, "dense")
-            # sparse_results already formatted by meili_search
+            sparse_results = format_hits(sparse_hits, "sparse")
+            
+            # Log separate results
+            logger.info(f"Dense results ({len(dense_results)}): {[f'{r.get('filename')}:{r.get('title')} (score:{r.get('score',0):.4f})' for r in dense_results[:5]]}")
+            logger.info(f"Sparse results ({len(sparse_results)}): {[f'{r.get('filename')}:{r.get('title')} (score:{r.get('score',0):.4f})' for r in sparse_results[:5]]}")
+            
+            # Full detailed logging for sparse results
+            print(f"\n{'='*80}")
+            print(f"[SPARSE RESULTS DETAIL] Total sparse chunks retrieved: {len(sparse_results)}")
+            print(f"{'='*80}")
+            for idx, result in enumerate(sparse_results, 1):
+                print(f"\n--- Sparse Chunk #{idx} ---")
+                print(f"Score: {result.get('score', 0):.4f}")
+                print(f"Filename: {result.get('filename', 'N/A')}")
+                print(f"Title: {result.get('title', 'N/A')}")
+                print(f"Index: {result.get('index', 'N/A')}")
+                print(f"Page Numbers: {result.get('page_numbers', 'N/A')}")
+                print(f"URL: {result.get('url', 'N/A')}")
+                text_preview = result.get('text', '')[:200] if result.get('text') else 'N/A'
+                print(f"Text Preview: {text_preview}{'...' if len(result.get('text', '')) > 200 else ''}")
+                print(f"Full Text Length: {len(result.get('text', ''))} chars")
+            print(f"{'='*80}\n")
             
             # 3d) Apply RRF fusion
             print(f"[Hybrid Search] Applying RRF fusion on {len(dense_results)} dense + {len(sparse_results)} sparse results")
@@ -1202,13 +1227,14 @@ async def search_documents(
     if not useHybrid:
         try:
             t0 = time.perf_counter()
-            hits = qdrant.search(
+            hits = qdrant.query_points(
                 collection_name=table,
-                query_vector=("dense", query_dense_vec),
+                query=query_dense_vec,
+                using="dense",
                 limit=search_limit,
                 with_payload=True,
                 score_threshold=None,
-            )
+            ).points
             print(f"[Dense-only Search] Qdrant returned {len(hits)} in {(time.perf_counter()-t0)*1000:.1f} ms")
             
             # Format dense-only results
@@ -1235,6 +1261,7 @@ async def search_documents(
                     "url":          md.get("url"),
                     "score":        float(hit.score) if hit.score is not None else 0.0
                 })
+            logger.info(f"Dense-only results ({len(initial_results)}): {[f'{r.get('filename')}:{r.get('title')} (score:{r.get('score',0):.4f})' for r in initial_results[:5]]}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Search error: {e}")
     
@@ -1315,13 +1342,7 @@ async def delete_document(companyId: str, filename: str = Query(...)):
     # 3) Delete from Qdrant
     qdrant.delete(collection_name=table, points_selector=qmodels.FilterSelector(filter=filter_q))
 
-    # 3.1) Delete from Meilisearch using filter (more efficient than ID-based deletion)
-    try:
-        meili.index(MEILI_INDEX).delete_documents(
-            filter=f'company_id = "{companyId}" AND filename = "{filename}"'
-        )
-    except Exception as e:
-        print(f"Warning: Meilisearch delete failed: {e}")
+    # Meilisearch removal: no secondary index to delete from
 
     # 4) Delete from GCS
     path = f"uploads/{companyId}/documents/{filename}"
@@ -1452,7 +1473,7 @@ async def process_sendable_file(
                 detail=f"Failed to generate embedding: {error_msg}"
             )
 
-    # 4) Prepare record and save to Qdrant with dense vectors only (sparse handled by Meilisearch)
+    # 4) Prepare record and save to Qdrant with dense and sparse vectors
     metadata = {
         "index": sendable_index,
         "file_type": (file.content_type or os.path.splitext(safe_name)[1]),
@@ -1468,29 +1489,22 @@ async def process_sendable_file(
     }
     
     point_id = sha_id(companyId, "sendable", safe_name)
-    # Build point with named dense vector
-    point = {
-        "id": point_id,
-        "vector": {
-            "dense": dense_embedding
+    # Build point with named dense and sparse vectors
+    sparse_vec = create_sparse_vector(description)
+    # IMPORTANT: Pass both dense and sparse vectors in the vector parameter
+    point = qmodels.PointStruct(
+        id=point_id,
+        vector={
+            "dense": dense_embedding,
+            "sparse": qmodels.SparseVector(
+                indices=sparse_vec.indices,
+                values=sparse_vec.values
+            )
         },
-        "payload": payload
-    }
+        payload=payload
+    )
     qdrant.upsert(collection_name=table, points=[point], wait=True)
-
-    # ---------- MEILI: index sendable ----------
-    meili.index(MEILI_INDEX).add_documents([{
-        "id": str(point_id),
-        "company_id": companyId,
-        "filename": safe_name,
-        "title": None,
-        "text": description,
-        "url": gcs_url,
-        "file_type": (file.content_type or os.path.splitext(safe_name)[1]),
-        "index": sendable_index,     # so you can filter/search by SF-123
-        "created_at": int(time.time())
-    }], primary_key="id")
-    # ------------------------------------------
+    
 
     ### MODIFIED ###
     total_count = qdrant.count(collection_name=table, exact=False).count
@@ -1569,22 +1583,20 @@ async def update_sendable_description(
     payload = point.payload or {}
     payload["text"] = new_description
     
-    # Build point with named dense vector
-    updated_point = {
-        "id": point.id,
-        "vector": {
-            "dense": new_dense_embedding
+    # Build point with named dense + sparse vectors
+    new_sparse = create_sparse_vector(new_description)
+    updated_point = qmodels.PointStruct(
+        id=point.id,
+        vector={
+            "dense": new_dense_embedding,
+            "sparse": qmodels.SparseVector(
+                indices=new_sparse.indices,
+                values=new_sparse.values
+            )
         },
-        "payload": payload
-    }
+        payload=payload
+    )
     qdrant.upsert(collection_name=table, points=[updated_point], wait=True)
-
-    # ---------- MEILI: update sendable ----------
-    meili.index(MEILI_INDEX).add_documents([{
-        "id": str(point.id),
-        "text": new_description
-    }], primary_key="id")
-    # ------------------------------------------
 
     return {"message": f"Description for '{safe_name}' updated successfully."}
 
@@ -1623,16 +1635,22 @@ async def search_sendable(
     if useHybrid:
         try:
             # Dense search
-            dense_hits = qdrant.search(
+            dense_hits = qdrant.query_points(
                 collection_name=table,
-                query_vector=("dense", query_dense_vec),
+                query=query_dense_vec,
+                using="dense",
                 limit=limit * 2,  # Get more for fusion
                 with_payload=True,
-            )
+            ).points
             
-            # Meilisearch BM25 search (replaces sparse)
-            sparse_results = meili_search(query=query, limit=limit*2, company_id=companyId,
-                                          extra_filters=['file_type != "document"'])  # optional filter for sendables
+            # Qdrant sparse search (replaces Meilisearch)
+            sparse_hits = qdrant.query_points(
+                collection_name=table,
+                query=create_sparse_vector(query),
+                using="sparse",
+                limit=limit * 2,
+                with_payload=True,
+            ).points
             
             # Format dense results
             def format_sendable_hits(hits):
@@ -1653,7 +1671,7 @@ async def search_sendable(
                 return formatted
             
             dense_results = format_sendable_hits(dense_hits)
-            # sparse_results already formatted by meili_search
+            sparse_results = format_sendable_hits(sparse_hits)
             
             # Apply RRF fusion
             fused = reciprocal_rank_fusion(dense_results, sparse_results)
@@ -1665,12 +1683,13 @@ async def search_sendable(
     
     # Fallback: dense-only search
     if not useHybrid:
-        hits = qdrant.search(
+        hits = qdrant.query_points(
             collection_name=table,
-            query_vector=("dense", query_dense_vec),
+            query=query_dense_vec,
+            using="dense",
             limit=limit,
             with_payload=True,
-        )
+        ).points
         
         for hit in hits:
             pl = hit.payload or {}
@@ -1766,13 +1785,11 @@ async def delete_sendable(
             must=[qmodels.FieldCondition(key="metadata.filename", match=qmodels.MatchValue(value=safe_name))]
         )
         identifier = f"filename '{safe_name}'"
-        meili_filter = f'company_id = "{companyId}" AND filename = "{safe_name}"'
-    else: # We know index is not None here because of the validation above
+    else:  # We know index is not None here because of the validation above
         filter_q = qmodels.Filter(
             must=[qmodels.FieldCondition(key="metadata.index", match=qmodels.MatchValue(value=index))]
         )
         identifier = f"index '{index}'"
-        meili_filter = f'company_id = "{companyId}" AND index = "{index}"'
 
     # 2) Find the record(s) to delete *before* deleting from the DB
     # We need the metadata to clean up GCS and Cloudinary
@@ -1817,11 +1834,7 @@ async def delete_sendable(
     # 4) Delete from Qdrant (now that cloud assets are gone)
     qdrant.delete(collection_name=table, points_selector=qmodels.FilterSelector(filter=filter_q))
 
-    # 4.1) Delete from Meilisearch using filter (more efficient than ID-based deletion)
-    try:
-        meili.index(MEILI_INDEX).delete_documents(filter=meili_filter)
-    except Exception as e:
-        print(f"Warning: Meilisearch delete failed: {e}")
+    # Meilisearch removal: no secondary index to delete from
 
     return {
         "message": f"Successfully deleted {deleted_count} record(s) and associated files for {identifier}.",
