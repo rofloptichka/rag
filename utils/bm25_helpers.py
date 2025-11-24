@@ -172,3 +172,54 @@ def bm25_update_stats(coll: str, tokens: list[str]) -> None:
     Alias for bm25_update_stats_redis for consistency with user's code.
     """
     bm25_update_stats_redis(coll, tokens)
+
+
+def bm25_decrement_stats(coll: str, tokens: list[str]) -> None:
+    """
+    Decrement BM25 statistics in Redis when a document is deleted/replaced.
+    This is the inverse of bm25_update_stats to prevent stat inflation on resyncs.
+
+    Args:
+        coll: Collection name
+        tokens: List of tokens from the document being removed
+    """
+    if r is None:
+        logger.debug("Redis not available, skipping BM25 stats decrement")
+        return
+
+    if not tokens:
+        return
+
+    try:
+        keys = _bm25_keys(coll)
+        pipe = r.pipeline(transaction=False)
+
+        # Decrement total document count (but not below 1)
+        current_n = int(r.get(keys["N"]) or 1)
+        if current_n > 1:
+            pipe.decr(keys["N"])
+
+        # Adjust average document length using reverse exponential moving average
+        # This approximates removing the document's contribution to the average
+        avgdl_old = float(r.get(keys["AVGDL"]) or 200.0)
+        doc_len = len(tokens)
+        # Reverse the EMA: if new_avg = 0.99 * old + 0.01 * doc_len
+        # then removing: new_avg ≈ (old - 0.01 * doc_len) / 0.99
+        # Simplified: just nudge it in the opposite direction
+        new_avg = max(50.0, 0.99 * avgdl_old - 0.01 * doc_len + 0.01 * avgdl_old)
+        pipe.set(keys["AVGDL"], new_avg)
+
+        # Decrement document frequency for unique terms (but not below 1)
+        seen = set(tokens)
+        for t in seen:
+            current_df = int(r.hget(keys["DF"], t) or 1)
+            if current_df > 1:
+                pipe.hincrby(keys["DF"], t, -1)
+            elif current_df == 1:
+                # Remove the term entirely if DF would become 0
+                pipe.hdel(keys["DF"], t)
+
+        pipe.execute()
+        logger.debug(f"BM25 stats decremented for collection '{coll}', doc_length={doc_len}")
+    except Exception as e:
+        logger.warning(f"Failed to decrement BM25 stats in Redis: {e}")

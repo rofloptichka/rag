@@ -54,12 +54,31 @@ def create_sparse_vector_doc_bm25(collection_name: str, text: str, k1: float = 1
     
     return qmodels.SparseVector(indices=idx, values=val)
 
-def company_doc_collection(company_id: str) -> str:
-    return f"docling_{company_id}"
+def company_doc_collection(company_id: str, source: str = "general", agent_id: Optional[str] = None) -> str:
+    """
+    Get the collection name for company documents.
 
-def get_company_doc_table(company_id: str):
+    Args:
+        company_id: The company identifier
+        source: Document source type - "general" for uploaded docs, "sheets" for Google Sheets/Docs
+        agent_id: Optional agent identifier for per-agent isolation (required for "sheets" source)
+
+    Returns:
+        Collection name in format:
+        - docling_{company_id} for general docs
+        - docling_{company_id}_sheets_{agent_id} for agent-specific Google Sheets/Docs
+    """
+    if source == "general":
+        return f"docling_{company_id}"
+    # For source-specific collections (e.g., "sheets"), include agent_id for isolation
+    if agent_id:
+        return f"docling_{company_id}_{source}_{agent_id}"
+    # Fallback for legacy calls without agent_id (not recommended for sheets)
+    return f"docling_{company_id}_{source}"
+
+def get_company_doc_table(company_id: str, source: str = "general", agent_id: Optional[str] = None):
     """Returns the collection name for the company's documents."""
-    collection = company_doc_collection(company_id)
+    collection = company_doc_collection(company_id, source, agent_id)
     ensure_collection(collection)
     return collection
 

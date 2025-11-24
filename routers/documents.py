@@ -32,6 +32,7 @@ from utils.qdrant_helpers import (
     _weighted_rrf, _tokenize_multilingual, _emb_cache,
     create_sparse_vector_doc_bm25, create_sparse_vector_query_bm25
 )
+from utils.bm25_helpers import bm25_decrement_stats, _tokenize_multilingual as bm25_tokenize
 
 from utils.reranker import rerank_with_openai, rerank_with_jina # и т.д.
 
@@ -56,20 +57,63 @@ async def process_document(
     softMaxTokens: Optional[int] = Query(None, description="Soft token cap for natural chunks"),
     hardMaxTokens: Optional[int] = Query(None, description="Hard token cap for natural chunks"),
     stream: Optional[bool] = Query(False, description="Stream processing updates via SSE"),
+    source: str = Query("general", description="Document source: 'general' for uploaded docs, 'sheets' for Google Sheets/Docs"),
+    agentId: Optional[str] = Query(None, description="Agent ID for source-specific documents (e.g., Google Sheets)"),
+    allowUpdate: bool = Query(False, description="Allow updating existing document (deletes old chunks first, for resync)"),
 ):
     safe_filename = safe_decode_filename(file.filename)
-    
+
     # 1) Check for duplicates
-    table = get_company_doc_table(companyId)
+    # For source-specific collections (e.g., "sheets"), use agent_id for isolation
+    table = get_company_doc_table(companyId, source, agentId)
     filter_q = qmodels.Filter(
         must=[qmodels.FieldCondition(key="metadata.filename", match=qmodels.MatchValue(value=safe_filename))]
     )
     dup_count = qdrant.count(collection_name=table, count_filter=filter_q, exact=True).count
     if dup_count > 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File '{safe_filename}' was already processed for company '{companyId}'."
-        )
+        if allowUpdate:
+            # Delete existing chunks to allow re-sync (used by Google Docs webhook updates)
+            logger.info(f"allowUpdate=True: Deleting {dup_count} existing chunks for '{safe_filename}' before re-indexing")
+
+            # Retrieve ALL existing chunks to decrement BM25 stats before deletion
+            # Must paginate through all results, not just first 1000
+            try:
+                total_decremented = 0
+                cursor = None
+                while True:
+                    existing_points, cursor = qdrant.scroll(
+                        collection_name=table,
+                        scroll_filter=filter_q,
+                        limit=1000,
+                        offset=cursor,
+                        with_payload=True,
+                    )
+                    if not existing_points:
+                        break
+
+                    # Collect all tokens from existing chunks and decrement BM25 stats
+                    for point in existing_points:
+                        if point.payload and point.payload.get("text"):
+                            old_text = point.payload["text"]
+                            old_title = (point.payload.get("metadata") or {}).get("title", "")
+                            sparse_source = f"{old_title}. {old_text}" if old_title else old_text
+                            old_tokens = bm25_tokenize(sparse_source)
+                            bm25_decrement_stats(table, old_tokens)
+                            total_decremented += 1
+
+                    if cursor is None:
+                        break
+
+                logger.info(f"Decremented BM25 stats for {total_decremented} chunks")
+            except Exception as bm25_err:
+                logger.warning(f"Failed to decrement BM25 stats: {bm25_err}")
+
+            qdrant.delete(collection_name=table, points_selector=qmodels.FilterSelector(filter=filter_q))
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File '{safe_filename}' was already processed for company '{companyId}'."
+            )
 
     try:
         # Read file content once at the beginning
@@ -413,19 +457,25 @@ async def process_document(
 
 @router.get("/search")
 async def search_documents(
-    companyId: str, 
-    query: str = Query(...), 
+    companyId: str,
+    query: str = Query(...),
     limit: int = Query(5),
     useReranker: bool = Query(True, description="Use reranker for better results"),
     rerankTopK: Optional[int] = Query(None, description="Number of docs to retrieve before reranking"),
     rerankerProvider: Optional[str] = Query(None, description="'openai' or 'jina' (overrides env flags)"),
     useHybrid: bool = Query(True, description="Use hybrid search (dense + sparse with RRF)"),
+    source: str = Query("general", description="Document source: 'general' for uploaded docs, 'sheets' for Google Sheets/Docs"),
+    agentId: Optional[str] = Query(None, description="Agent ID for source-specific documents (e.g., Google Sheets)"),
 ):
     """
     Search through company documents using hybrid semantic + keyword search with RRF fusion.
     Returns matching chunks with their metadata and relevance scores.
+
+    The 'source' parameter allows searching specific document collections:
+    - 'general': Regular uploaded documents (default)
+    - 'sheets': Google Sheets/Docs content (requires agentId for per-agent isolation)
     """
-    table = get_company_doc_table(companyId)
+    table = get_company_doc_table(companyId, source, agentId)
     # 1) Get dense embedding for the query
     try:
         # Use cache for repeated queries to reduce TTFB
@@ -680,13 +730,18 @@ async def search_documents(
     }
 
 @router.delete("/delete-document")
-async def delete_document(companyId: str, filename: str = Query(...)):
+async def delete_document(
+    companyId: str,
+    filename: str = Query(...),
+    source: str = Query("general", description="Document source: 'general' for uploaded docs, 'sheets' for Google Sheets/Docs"),
+    agentId: Optional[str] = Query(None, description="Agent ID for source-specific documents (e.g., Google Sheets)"),
+):
     """
-    Delete a document and its chunks from bsooth Qdrant and GCS.
+    Delete a document and its chunks from both Qdrant and GCS.
     The filename parameter should be just the filename, not a JSON object.
     """
     # 1) Get the table
-    table = get_company_doc_table(companyId)
+    table = get_company_doc_table(companyId, source, agentId)
 
     # 2) Count matching records before deletion
     filter_q = qmodels.Filter(
@@ -702,13 +757,15 @@ async def delete_document(companyId: str, filename: str = Query(...)):
 
     # Meilisearch removal: no secondary index to delete from
 
-    # 4) Delete from GCS
-    path = f"uploads/{companyId}/documents/{filename}"
-    try:
-        bucket.blob(path).delete()
-    except Exception as e:
-        # Log the error but don't fail the request since the DB deletion succeeded
-        print(f"Warning: Failed to delete file from GCS: {str(e)}")
+    # 4) Delete from GCS (only for general uploaded documents, not for sheets/docs)
+    # Google Sheets/Docs are streamed directly as markdown and don't have GCS files
+    if source == "general":
+        path = f"uploads/{companyId}/documents/{filename}"
+        try:
+            bucket.blob(path).delete()
+        except Exception as e:
+            # Log the error but don't fail the request since the DB deletion succeeded
+            print(f"Warning: Failed to delete file from GCS: {str(e)}")
 
     return {
         "message": f"Deleted {deleted} chunks from Qdrant and attempted to remove file from GCS.",
