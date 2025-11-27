@@ -92,10 +92,27 @@ def company_sendable_collection(company_id: str) -> str:
     return f"sendable_files_{company_id}"
 
 def ensure_collection(name: str):
-    """Create Qdrant collection if missing with HNSW index tuned for latency and sparse vectors."""
+    """Create Qdrant collection if missing with HNSW index tuned for latency and sparse vectors.
+    
+    Also handles migration: if collection exists but lacks named vectors (dense/sparse),
+    it will be deleted and recreated with the correct schema.
+    """
     try:
-        qdrant.get_collection(name)
-        return
+        collection_info = qdrant.get_collection(name)
+        # Check if collection has the correct named vector configuration
+        vectors_config = collection_info.config.params.vectors
+        
+        # If vectors_config is a dict with 'dense' key, schema is correct
+        if isinstance(vectors_config, dict) and "dense" in vectors_config:
+            return
+        
+        # Otherwise, collection has old schema (unnamed vectors) - need to recreate
+        # WARNING: This will delete all existing data in the collection!
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Collection '{name}' has old schema without named vectors. Recreating with correct schema...")
+        logger.warning(f"Current vectors_config type: {type(vectors_config)}, value: {vectors_config}")
+        qdrant.delete_collection(name)
     except Exception:
         pass
 
