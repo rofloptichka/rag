@@ -275,10 +275,10 @@ async def search_sendable(
 ):
     table = get_company_sendable_table(companyId)
 
-    # 1) Get dense embedding for the query
+    # 1) Get dense embedding for the query (must use same model as document indexing)
     try:
-        emb_resp = client.embeddings.create(
-            model="text-embedding-3-large",
+        emb_resp = client_fast.embeddings.create(
+            model=EMBED_MODEL,
             input=query
         )
         query_dense_vec = emb_resp.data[0].embedding
