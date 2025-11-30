@@ -13,6 +13,7 @@ from utils.tokenizer import OpenAITokenizerWrapper
 
 from docling.document_converter import DocumentConverter
 from docling.chunking import HybridChunker
+import google.generativeai as genai
 
 
 # Загружаем переменные окружения
@@ -20,13 +21,22 @@ load_dotenv()
 
 # --- Клиенты и Глобальные Настройки ---
 
-# OpenAI
+# OpenAI (for reranking and other tasks)
+from openai import AsyncOpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
-EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")
-EMBED_DIMS = int(os.getenv("OPENAI_EMBED_DIMS", "3072"))
-OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "15"))
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "10"))
 client_fast = client.with_options(timeout=OPENAI_TIMEOUT)
+client_async = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)
+
+# Gemini Embeddings Configuration
+# gemini-embedding-001: Best multilingual model, supports Russian/Kazakh
+# 3072 dimensions, faster than OpenAI, excellent quality
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # or GEMINI_API_KEY
+genai.configure(api_key=GOOGLE_API_KEY)
+EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
+EMBED_DIMS = int(os.getenv("EMBED_DIMS", "768"))  # Use 768 for speed, up to 3072 for max quality
+EMBED_TASK_TYPE = os.getenv("EMBED_TASK_TYPE", "RETRIEVAL_DOCUMENT")  # or RETRIEVAL_QUERY for queries
 
 # Google Cloud Storage
 b64_key = os.environ["GOOGLE_CLOUD_KEY"]

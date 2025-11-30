@@ -8,11 +8,17 @@ import os
 import regex
 from collections import Counter
 from typing import List, Optional, Dict, Any, Tuple
+import asyncio
+import google.generativeai as genai
+
 # Импортируем клиентов и настройки из config.py
-from config import qdrant, client_fast, EMBED_MODEL, EMBED_DIMS
+from config import qdrant, EMBED_MODEL, EMBED_DIMS, EMBED_TASK_TYPE
 
 # Импортируем BM25 функции, которые нужны для создания sparse векторов
-from .bm25_helpers import bm25_update_stats, bm25_update_stats_redis, _get_stats, _idf, _tokenize_multilingual
+from .bm25_helpers import (
+    bm25_update_stats, bm25_update_stats_redis, 
+    _get_stats, _get_stats_cached, _idf, _tokenize_multilingual
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -159,24 +165,64 @@ def sha_id(*parts: str) -> int:
     v = int.from_bytes(h[:8], byteorder="big", signed=False)  # 64-bit unsigned
     return v & INT64_MAX  # Constrain to signed 64-bit range (0 to 2^63-1)
 
-def embed_texts(texts: List[str]) -> List[List[float]]:
-    """Generate embeddings for a list of texts. Raises HTTPException on failure."""
+def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> List[List[float]]:
+    """
+    Generate embeddings using Google Gemini embedding model.
+    
+    Args:
+        texts: List of texts to embed
+        task_type: Task type for embeddings:
+            - "RETRIEVAL_DOCUMENT" for indexing documents
+            - "RETRIEVAL_QUERY" for search queries
+            - "SEMANTIC_SIMILARITY" for similarity comparisons
+    
+    Returns:
+        List of embedding vectors
+    """
     try:
-        # Batch embeddings to reduce overhead; OpenAI supports batching via list input
-        resp = client_fast.embeddings.create(model=EMBED_MODEL, input=texts)
-        return [d.embedding for d in resp.data]
+        # Gemini supports batching - embed all texts at once
+        result = genai.embed_content(
+            model=EMBED_MODEL,
+            content=texts,
+            task_type=task_type,
+            output_dimensionality=EMBED_DIMS,
+        )
+        # result.embedding is a list of embeddings when content is a list
+        return result['embedding']
     except Exception as e:
         error_msg = str(e)
-        if "429" in error_msg or "rate_limit" in error_msg.lower():
+        if "429" in error_msg or "quota" in error_msg.lower() or "rate" in error_msg.lower():
             raise HTTPException(
                 status_code=429,
-                detail="OpenAI API rate limit exceeded during document processing. Please try again in a few moments."
+                detail="Google API rate limit exceeded. Please try again in a few moments."
             )
         else:
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to generate embeddings: {error_msg}"
             )
+
+def embed_text_single(text: str, task_type: str = "RETRIEVAL_QUERY") -> List[float]:
+    """
+    Generate embedding for a single text using Gemini.
+    Optimized for query embeddings with appropriate task type.
+    """
+    try:
+        result = genai.embed_content(
+            model=EMBED_MODEL,
+            content=text,
+            task_type=task_type,
+            output_dimensionality=EMBED_DIMS,
+        )
+        return result['embedding']
+    except Exception as e:
+        error_msg = str(e)
+        if "429" in error_msg or "quota" in error_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="Google API rate limit exceeded. Please try again."
+            )
+        raise HTTPException(status_code=500, detail=f"Embedding failed: {error_msg}")
 
 def stable_hash(text: str) -> int:
     """Create a stable 32-bit unsigned hash from text (suitable for Qdrant sparse indices)."""
@@ -230,6 +276,7 @@ def create_sparse_vector(text: str, collection_name: Optional[str] = None, updat
 def create_sparse_vector_query_bm25(collection_name: str, text: str) -> qmodels.SparseVector:
     """
     Create BM25 sparse vector for query search (IDF-weighted term frequencies).
+    Uses cached BM25 stats to reduce Redis round-trips.
     
     Query BM25 formula (simplified):
     weight(term) = tf(term) * IDF(term)
@@ -242,7 +289,8 @@ def create_sparse_vector_query_bm25(collection_name: str, text: str) -> qmodels.
         Qdrant SparseVector with IDF-weighted term frequencies
     """
     tokens = _tokenize_multilingual(text)
-    s = _get_stats(collection_name)
+    # Use cached stats for queries (don't need fresh stats every time)
+    s = _get_stats_cached(collection_name)
     tf = Counter(tokens)
     
     idx, val = [], []
@@ -335,21 +383,42 @@ def _weighted_rrf(
 # ------------------------------------------------------------------------------
 # Small in-memory LRU cache for query embeddings (speeds up repeated searches)
 # ------------------------------------------------------------------------------
-_EMB_CACHE_MAX = int(os.getenv("QUERY_EMBED_CACHE_SIZE", "200"))
+_EMB_CACHE_MAX = int(os.getenv("QUERY_EMBED_CACHE_SIZE", "500"))
 _emb_cache: "OrderedDict[str, List[float]]" = OrderedDict()
 
 def get_cached_query_embedding(query: str) -> List[float]:
+    """
+    Synchronous Gemini embedding with LRU cache.
+    Uses RETRIEVAL_QUERY task type for optimal search performance.
+    """
     key = query.strip()
     if not key:
         return []
     vec = _emb_cache.get(key)
     if vec is not None:
-        # move to end (recently used)
         _emb_cache.move_to_end(key)
         return vec
-    # compute and cache
-    emb_resp = client_fast.embeddings.create(model=EMBED_MODEL, input=key)
-    vec = emb_resp.data[0].embedding
+    # Compute embedding with Gemini
+    vec = embed_text_single(key, task_type="RETRIEVAL_QUERY")
+    _emb_cache[key] = vec
+    if len(_emb_cache) > _EMB_CACHE_MAX:
+        _emb_cache.popitem(last=False)
+    return vec
+
+async def get_cached_query_embedding_async(query: str) -> List[float]:
+    """
+    Async Gemini embedding with cache - runs in thread pool to not block event loop.
+    Gemini SDK is sync, so we wrap it with asyncio.to_thread for async context.
+    """
+    key = query.strip()
+    if not key:
+        return []
+    vec = _emb_cache.get(key)
+    if vec is not None:
+        _emb_cache.move_to_end(key)
+        return vec
+    # Run sync Gemini call in thread pool
+    vec = await asyncio.to_thread(embed_text_single, key, "RETRIEVAL_QUERY")
     _emb_cache[key] = vec
     if len(_emb_cache) > _EMB_CACHE_MAX:
         _emb_cache.popitem(last=False)

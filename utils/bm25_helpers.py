@@ -2,11 +2,20 @@ import unicodedata
 import regex
 import math
 import logging
+import time
 from config import r  # Импортируем готовый клиент Redis из config.py
 from typing import Dict, Any
+from functools import lru_cache
 
 
 logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------------------
+# BM25 Stats Cache (reduces Redis round-trips during search)
+# ------------------------------------------------------------------------------
+_bm25_stats_cache: Dict[str, Dict[str, Any]] = {}
+_bm25_cache_ttl: Dict[str, float] = {}
+_BM25_CACHE_TTL_SECONDS = 30  # Cache stats for 30 seconds
 
 # ------------------------------------------------------------------------------
 # Multilingual Tokenization & Normalization Utilities
@@ -143,6 +152,29 @@ def _get_stats(coll: str) -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"Failed to get BM25 stats from Redis: {e}")
         return {"N": 1, "AVGDL": 200.0, "DF": {}}
+
+def _get_stats_cached(coll: str) -> Dict[str, Any]:
+    """
+    Get BM25 statistics with in-memory caching to reduce Redis round-trips.
+    Cached for 30 seconds - suitable for search queries where stats don't change frequently.
+    
+    Args:
+        coll: Collection name
+    
+    Returns:
+        Dictionary containing N (total docs), AVGDL (average doc length), and DF key
+    """
+    now = time.time()
+    cached_time = _bm25_cache_ttl.get(coll, 0)
+    
+    if coll in _bm25_stats_cache and (now - cached_time) < _BM25_CACHE_TTL_SECONDS:
+        return _bm25_stats_cache[coll]
+    
+    # Fetch fresh stats
+    stats = _get_stats(coll)
+    _bm25_stats_cache[coll] = stats
+    _bm25_cache_ttl[coll] = now
+    return stats
 
 def _idf(term: str, N: int, DF_key: str, eps: float = 0.5) -> float:
     """

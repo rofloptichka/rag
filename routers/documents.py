@@ -28,7 +28,7 @@ from utils.processing import (
 )
 from utils.qdrant_helpers import (
     get_company_doc_table, sha_id, embed_texts,
-    get_cached_query_embedding,
+    get_cached_query_embedding, get_cached_query_embedding_async,
     _weighted_rrf, _tokenize_multilingual, _emb_cache,
     create_sparse_vector_doc_bm25, create_sparse_vector_query_bm25
 )
@@ -470,33 +470,12 @@ async def search_documents(
     """
     Search through company documents using hybrid semantic + keyword search with RRF fusion.
     Returns matching chunks with their metadata and relevance scores.
-
-    The 'source' parameter allows searching specific document collections:
-    - 'general': Regular uploaded documents (default)
-    - 'sheets': Google Sheets/Docs content (requires agentId for per-agent isolation)
+    Optimized for <500ms response time.
     """
+    search_start = time.perf_counter()
     table = get_company_doc_table(companyId, source, agentId)
-    # 1) Get dense embedding for the query
-    try:
-        # Use cache for repeated queries to reduce TTFB
-        t0 = time.perf_counter()
-        query_dense_vec = get_cached_query_embedding(query)
-        logger.info(f"Query processed: '{query}' -> dense embedding generated in {(time.perf_counter()-t0)*1000:.1f} ms")
-        print(f"[Search] Query embedding in {(time.perf_counter()-t0)*1000:.1f} ms (cached={'yes' if query in _emb_cache else 'no'})")
-    except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg or "rate_limit" in error_msg.lower():
-            raise HTTPException(
-                status_code=429,
-                detail="OpenAI API rate limit exceeded. Please try again in a few moments."
-            )
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to generate query embedding: {error_msg}"
-            )
-
-    # 2) Determine reranker provider and search limits
+    
+    # 1) Determine reranker provider and search limits FIRST (no I/O)
     provider = (rerankerProvider or "").strip().lower() if rerankerProvider else None
     use_openai = False
     use_jina = False
@@ -506,7 +485,6 @@ async def search_documents(
         elif provider == "jina":
             use_jina = JINA_RERANKER_ENABLED and bool(JINA_API_KEY)
         else:
-            # Default preference: OpenAI if enabled; otherwise Jina if enabled
             if OPENAI_RERANKER_ENABLED:
                 use_openai = True
             elif JINA_RERANKER_ENABLED and bool(JINA_API_KEY):
@@ -515,19 +493,37 @@ async def search_documents(
     rerank_enabled = use_openai or use_jina
     search_limit = rerankTopK or (OPENAI_RERANKER_TOP_K if rerank_enabled else limit)
     
+    # 2) Start embedding generation async while preparing sparse vector
+    try:
+        t0 = time.perf_counter()
+        # Check cache first (instant if cached)
+        if query.strip() in _emb_cache:
+            query_dense_vec = _emb_cache[query.strip()]
+            _emb_cache.move_to_end(query.strip())
+            logger.debug(f"Query embedding cache hit in {(time.perf_counter()-t0)*1000:.1f}ms")
+        else:
+            # Use async embedding - doesn't block event loop
+            query_dense_vec = await get_cached_query_embedding_async(query)
+            logger.debug(f"Query embedding generated in {(time.perf_counter()-t0)*1000:.1f}ms")
+    except Exception as e:
+        error_msg = str(e)
+        if "429" in error_msg or "rate_limit" in error_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="OpenAI API rate limit exceeded. Please try again in a few moments."
+            )
+        raise HTTPException(status_code=500, detail=f"Failed to generate query embedding: {error_msg}")
+
     # 3) Hybrid search: dense + sparse with RRF fusion
     initial_results = []
     
     if useHybrid:
         try:
-            # Log query sparse vector creation with BM25
+            # Create sparse vector (uses cached BM25 stats)
             query_sparse_vec = create_sparse_vector_query_bm25(table, query)
-            query_tokens = _tokenize_multilingual(query)
-            logger.info(f"Query sparse vector: tokens={query_tokens[:20]}{'...' if len(query_tokens) > 20 else ''} (total {len(query_tokens)}), indices={query_sparse_vec.indices[:10]}{'...' if len(query_sparse_vec.indices) > 10 else ''}")
             
             t0 = time.perf_counter()
-            print(f"[Hybrid Search] Parallel dense + sparse (Qdrant), limit={search_limit}")
-            
+            # Run dense and sparse searches in parallel
             async def _dense_job():
                 return await asyncio.to_thread(
                     qdrant.query_points,
@@ -550,11 +546,10 @@ async def search_documents(
             dense_result, sparse_result = await asyncio.gather(_dense_job(), _sparse_job())
             dense_hits = dense_result.points
             sparse_hits = sparse_result.points
-            t1 = time.perf_counter()
-            print(f"[Hybrid Search] Dense={len(dense_hits)} Sparse={len(sparse_hits)} in {(t1-t0)*1000:.1f} ms")
+            logger.debug(f"Qdrant search: Dense={len(dense_hits)} Sparse={len(sparse_hits)} in {(time.perf_counter()-t0)*1000:.1f}ms")
             
-            # 3c) Format results
-            def format_hits(hits, score_prefix=""):
+            # Format results (optimized - single pass)
+            def format_hits(hits):
                 results = []
                 for hit in hits:
                     pl = hit.payload or {}
@@ -565,88 +560,51 @@ async def search_documents(
                         try:
                             page_numbers = json.loads(pn_raw)
                         except Exception:
-                            page_numbers = None
+                            pass
                     elif isinstance(pn_raw, list):
                         page_numbers = pn_raw
 
                     results.append({
-                        "id":           str(hit.id),  # Keep true point ID as string for fusion
-                        "text":         pl.get("text"),
-                        "filename":     md.get("filename"),
+                        "id": str(hit.id),
+                        "text": pl.get("text"),
+                        "filename": md.get("filename"),
                         "page_numbers": page_numbers,
-                        "title":        md.get("title"),
-                        "url":          md.get("url"),
-                        "score":        float(hit.score) if hit.score is not None else 0.0
+                        "title": md.get("title"),
+                        "url": md.get("url"),
+                        "score": float(hit.score) if hit.score is not None else 0.0
                     })
                 return results
             
-            print(f"[Hybrid Search] Formatting dense results")
-            dense_results = format_hits(dense_hits, "dense")
-            sparse_results = format_hits(sparse_hits, "sparse")
+            dense_results = format_hits(dense_hits)
+            sparse_results = format_hits(sparse_hits)
             
-            # Log separate results
-            logger.info(f"Dense results ({len(dense_results)}): {[f'{r.get('filename')}:{r.get('title')} (score:{r.get('score',0):.4f})' for r in dense_results[:5]]}")
-            logger.info(f"Sparse results ({len(sparse_results)}): {[f'{r.get('filename')}:{r.get('title')} (score:{r.get('score',0):.4f})' for r in sparse_results[:5]]}")
-            
-            # Full detailed logging for sparse results
-            print(f"\n{'='*80}")
-            print(f"[SPARSE RESULTS DETAIL] Total sparse chunks retrieved: {len(sparse_results)}")
-            print(f"{'='*80}")
-            for idx, result in enumerate(sparse_results, 1):
-                print(f"\n--- Sparse Chunk #{idx} ---")
-                print(f"Score: {result.get('score', 0):.4f}")
-                print(f"Filename: {result.get('filename', 'N/A')}")
-                print(f"Title: {result.get('title', 'N/A')}")
-                print(f"Index: {result.get('index', 'N/A')}")
-                print(f"Page Numbers: {result.get('page_numbers', 'N/A')}")
-                print(f"URL: {result.get('url', 'N/A')}")
-                text_preview = result.get('text', '')[:200] if result.get('text') else 'N/A'
-                print(f"Text Preview: {text_preview}{'...' if len(result.get('text', '')) > 200 else ''}")
-                print(f"Full Text Length: {len(result.get('text', ''))} chars")
-            print(f"{'='*80}\n")
-            
-            # 3d) Apply weighted RRF fusion with boost for short queries
-            print(f"[Hybrid Search] Applying RRF fusion on {len(dense_results)} dense + {len(sparse_results)} sparse results")
-            
-            # Detect short queries and apply weight adjustment
+            # Apply weighted RRF fusion (boost sparse for short queries)
             q_toks = _tokenize_multilingual(query)
-            short = (len(q_toks) <= 3)
-            if short:
-                logger.info(f"Short query detected ({len(q_toks)} tokens), boosting sparse weight")
-                initial_results = _weighted_rrf(dense_results, sparse_results,
-                                               w_dense=0.8, w_sparse=1.2)
+            if len(q_toks) <= 3:
+                initial_results = _weighted_rrf(dense_results, sparse_results, w_dense=0.8, w_sparse=1.2)
             else:
-                initial_results = _weighted_rrf(dense_results, sparse_results,
-                                               w_dense=1.0, w_sparse=1.0)
-            
-            print(f"[Hybrid Search] RRF fusion produced {len(initial_results)} results")
-            if initial_results:
-                print(f"[Hybrid Search] Top RRF score: {initial_results[0].get('rrf_score', 0):.6f}")
-                print(f"[Hybrid Search] Top result: {initial_results[0].get('filename')} - {initial_results[0].get('title')}")
+                initial_results = _weighted_rrf(dense_results, sparse_results, w_dense=1.0, w_sparse=1.0)
             
         except Exception as e:
-            # Fallback to dense-only search if hybrid fails
-            print(f"[Hybrid Search] ERROR: Hybrid search failed, falling back to dense-only: {e}")
-            import traceback
-            print(f"[Hybrid Search] Traceback: {traceback.format_exc()}")
+            logger.warning(f"Hybrid search failed, falling back to dense-only: {e}")
             useHybrid = False
     
     # Fallback: dense-only search
     if not useHybrid:
         try:
             t0 = time.perf_counter()
-            hits = qdrant.query_points(
+            hits = await asyncio.to_thread(
+                qdrant.query_points,
                 collection_name=table,
                 query=query_dense_vec,
                 using="dense",
                 limit=search_limit,
                 with_payload=True,
                 score_threshold=None,
-            ).points
-            print(f"[Dense-only Search] Qdrant returned {len(hits)} in {(time.perf_counter()-t0)*1000:.1f} ms")
+            )
+            hits = hits.points
+            logger.debug(f"Dense-only search: {len(hits)} results in {(time.perf_counter()-t0)*1000:.1f}ms")
             
-            # Format dense-only results
-            initial_results = []
             for hit in hits:
                 pl = hit.payload or {}
                 md = pl.get("metadata", {})
@@ -656,20 +614,19 @@ async def search_documents(
                     try:
                         page_numbers = json.loads(pn_raw)
                     except Exception:
-                        page_numbers = None
+                        pass
                 elif isinstance(pn_raw, list):
                     page_numbers = pn_raw
 
                 initial_results.append({
-                    "id":           str(hit.id),  # Include Qdrant point ID as string
-                    "text":         pl.get("text"),
-                    "filename":     md.get("filename"),
+                    "id": str(hit.id),
+                    "text": pl.get("text"),
+                    "filename": md.get("filename"),
                     "page_numbers": page_numbers,
-                    "title":        md.get("title"),
-                    "url":          md.get("url"),
-                    "score":        float(hit.score) if hit.score is not None else 0.0
+                    "title": md.get("title"),
+                    "url": md.get("url"),
+                    "score": float(hit.score) if hit.score is not None else 0.0
                 })
-            logger.info(f"Dense-only results ({len(initial_results)}): {[f'{r.get('filename')}:{r.get('title')} (score:{r.get('score',0):.4f})' for r in initial_results[:5]]}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Search error: {e}")
     
@@ -719,13 +676,17 @@ async def search_documents(
                     "rerank_time_ms": int((time.time() - start_time) * 1000)
                 })
         except Exception as rerank_error:
-            print(f"Reranking failed, using vector results: {rerank_error}")
+            logger.warning(f"Reranking failed: {rerank_error}")
             final_results = initial_results[:limit]
     else:
         final_results = initial_results[:limit]
     
+    total_time_ms = int((time.perf_counter() - search_start) * 1000)
+    logger.info(f"Search completed in {total_time_ms}ms for query: '{query[:50]}...'")
+    
     return {
         "results": final_results,
+        "search_time_ms": total_time_ms,
         **rerank_metadata
     }
 
