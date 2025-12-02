@@ -14,3 +14,7 @@ google-generativeai
 cloudinary
 regex
 redis
+
+onnxruntime
+rapidocr-onnxruntime
+opencv-python-headless
