@@ -18,12 +18,12 @@ from config import (
     RAG_USE_LLM_UNDERSTAND_DEFAULT, RAG_NATURAL_CHUNKING_DEFAULT,
     RAG_SOFT_MAX_TOKENS, RAG_HARD_MAX_TOKENS,
     OPENAI_RERANKER_ENABLED, JINA_RERANKER_ENABLED, JINA_API_KEY, OPENAI_RERANKER_TOP_K,
-    OPENAI_RERANKER_MODEL, OPENAI_RERANKER_TIMEOUT, 
+    OPENAI_RERANKER_MODEL, OPENAI_RERANKER_TIMEOUT,
     JINA_RERANKER_MODEL, JINA_RERANKER_ENDPOINT, JINA_RERANKER_TIMEOUT,
     converter, chunker
 )
 from utils.processing import (
-    safe_decode_filename, upload_to_gcs, 
+    safe_decode_filename, upload_to_gcs,
     _extract_sections_from_markdown, _build_natural_chunks, _llm_understand_sections, _sse_format
 )
 from utils.qdrant_helpers import (
@@ -35,6 +35,7 @@ from utils.qdrant_helpers import (
 from utils.bm25_helpers import bm25_decrement_stats, _tokenize_multilingual as bm25_tokenize
 
 from utils.reranker import rerank_with_openai, rerank_with_jina # и т.д.
+from utils.vlm_converter import convert_with_vlm_fallback
 
 # Настраиваем логирование
 logger = logging.getLogger(__name__)
@@ -142,8 +143,22 @@ async def process_document(
 
                 # 4) Process with Docling
                 yield _sse_format("status", {"step": "docling_convert", "message": "Converting with Docling"})
-                result = converter.convert(source=temp_path)
+                result = convert_with_vlm_fallback(source=temp_path)
                 document = result.document
+
+                # Debug: print image transcriptions from VLM
+                from docling_core.types.doc import PictureItem
+                picture_count = 0
+                for element, _level in document.iterate_items():
+                    if isinstance(element, PictureItem):
+                        picture_count += 1
+                        print(f"[PICTURE {picture_count}]: annotations={len(element.annotations) if element.annotations else 0}")
+                        if element.annotations:
+                            for ann in element.annotations:
+                                if hasattr(ann, 'text') and ann.text:
+                                    print(f"[IMAGE TRANSCRIPTION]: {ann.text}")
+                print(f"[DEBUG] Total pictures found: {picture_count}")
+
                 markdown_output = document.export_to_markdown()
                 yield _sse_format("debug", {"markdown_preview": markdown_output[:500]})
 
@@ -309,8 +324,22 @@ async def process_document(
         )
 
         # 4) Process with Docling
-        result = converter.convert(source=temp_path)
+        result = convert_with_vlm_fallback(source=temp_path)
         document = result.document
+
+        # Debug: print image transcriptions from VLM
+        from docling_core.types.doc import PictureItem
+        picture_count = 0
+        for element, _level in document.iterate_items():
+            if isinstance(element, PictureItem):
+                picture_count += 1
+                print(f"[PICTURE {picture_count}]: annotations={len(element.annotations) if element.annotations else 0}")
+                if element.annotations:
+                    for ann in element.annotations:
+                        if hasattr(ann, 'text') and ann.text:
+                            print(f"[IMAGE TRANSCRIPTION]: {ann.text}")
+        print(f"[DEBUG] Total pictures found: {picture_count}")
+
         markdown_output = document.export_to_markdown()
 
         # Resolve flags

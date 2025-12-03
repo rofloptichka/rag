@@ -14,6 +14,12 @@ from utils.tokenizer import OpenAITokenizerWrapper
 from docling.document_converter import DocumentConverter
 from docling.chunking import HybridChunker
 import google.generativeai as genai
+from docling.datamodel.pipeline_options import (
+    PdfPipelineOptions,
+    PictureDescriptionApiOptions,
+)
+from docling.datamodel.base_models import InputFormat
+from docling.document_converter import PdfFormatOption
 
 
 # Загружаем переменные окружения
@@ -37,6 +43,23 @@ genai.configure(api_key=GOOGLE_API_KEY)
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
 EMBED_DIMS = int(os.getenv("EMBED_DIMS", "768"))  # Use 768 for speed, up to 3072 for max quality
 EMBED_TASK_TYPE = os.getenv("EMBED_TASK_TYPE", "RETRIEVAL_DOCUMENT")  # or RETRIEVAL_QUERY for queries
+
+# Gemini VLM for image transcription
+GEMINI_VLM_MODEL = os.getenv("GEMINI_VLM_MODEL", "gemini-2.0-flash")
+GEMINI_VLM_TIMEOUT = int(os.getenv("GEMINI_VLM_TIMEOUT", "30"))
+GEMINI_VLM_PROMPT = """Analyze this image and provide:
+1. OCR: Extract all visible text exactly as written
+2. Description: Describe what the image shows (charts, diagrams, photos, etc.)
+3. Summary: One sentence explaining the image's purpose or meaning
+
+Format your response as:
+[TEXT]: <extracted text or "No text visible">
+[DESCRIPTION]: <what the image contains>
+[SUMMARY]: <purpose/meaning>"""
+
+# Fallback VLM (OpenAI) for when Gemini fails
+OPENAI_VLM_MODEL = os.getenv("OPENAI_VLM_MODEL", "gpt-4o-mini")
+OPENAI_VLM_TIMEOUT = int(os.getenv("OPENAI_VLM_TIMEOUT", "30"))
 
 # Google Cloud Storage
 b64_key = os.environ["GOOGLE_CLOUD_KEY"]
@@ -72,11 +95,34 @@ def _parse_bool_env(value: str | None, default: bool) -> bool:
     if value is None: return default
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-# Docling configuration
-converter = DocumentConverter()
+# Docling configuration with Gemini VLM for image transcription
 tokenizer = OpenAITokenizerWrapper()
 MAX_TOKENS = int(os.getenv("HYBRID_CHUNK_MAX_TOKENS", "512"))
 chunker = HybridChunker(tokenizer=tokenizer, max_tokens=MAX_TOKENS, merge_peers=True)
+
+# Configure PDF pipeline with Gemini VLM for picture descriptions
+_pdf_pipeline_options = PdfPipelineOptions(
+    enable_remote_services=True,
+    do_picture_description=True,
+    do_formula_enrichment=True,  # OCR formulas to LaTeX
+)
+_pdf_pipeline_options.picture_description_options = PictureDescriptionApiOptions(
+    url=f"https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    headers={"Authorization": f"Bearer {GOOGLE_API_KEY}"},
+    params={
+        "model": GEMINI_VLM_MODEL,
+        "max_tokens": 500,
+    },
+    prompt=GEMINI_VLM_PROMPT,
+    timeout=GEMINI_VLM_TIMEOUT,
+    provenance="gemini-2.0-flash",
+)
+
+converter = DocumentConverter(
+    format_options={
+        InputFormat.PDF: PdfFormatOption(pipeline_options=_pdf_pipeline_options),
+    }
+)
 
 
 # RAG configuration
