@@ -8,7 +8,11 @@ from fastapi import FastAPI, Request
 from routers import documents, sendables
 
 # Настраиваем логирование (можно вынести в отдельный logging_config.py)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
+# Force stdout handler to avoid red stderr output
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logging.root.handlers = [handler]
+logging.root.setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Создаем приложение FastAPI
