@@ -255,3 +255,37 @@ def bm25_decrement_stats(coll: str, tokens: list[str]) -> None:
         logger.debug(f"BM25 stats decremented for collection '{coll}', doc_length={doc_len}")
     except Exception as e:
         logger.warning(f"Failed to decrement BM25 stats in Redis: {e}")
+
+
+def bm25_reset_stats(coll: str) -> None:
+    """
+    Reset all BM25 statistics for a collection.
+    Used when reindexing a collection from scratch.
+
+    Args:
+        coll: Collection name
+    """
+    if r is None:
+        logger.debug("Redis not available, skipping BM25 stats reset")
+        return
+
+    try:
+        keys = _bm25_keys(coll)
+        pipe = r.pipeline(transaction=False)
+
+        # Delete all BM25 keys for this collection
+        pipe.delete(keys["N"])
+        pipe.delete(keys["AVGDL"])
+        pipe.delete(keys["DF"])
+
+        pipe.execute()
+
+        # Clear cache for this collection
+        if coll in _bm25_stats_cache:
+            del _bm25_stats_cache[coll]
+        if coll in _bm25_cache_ttl:
+            del _bm25_cache_ttl[coll]
+
+        logger.info(f"BM25 stats reset for collection '{coll}'")
+    except Exception as e:
+        logger.warning(f"Failed to reset BM25 stats in Redis: {e}")

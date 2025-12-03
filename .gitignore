@@ -19,3 +19,6 @@ example_bm25_redis_integration.py
 example_bm25_usage.py
 
 init
+
+scripts/test_files
+scripts/upload_sendable.py

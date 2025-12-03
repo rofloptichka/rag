@@ -1,5 +1,6 @@
 # main.py
 import time
+import sys
 import logging
 from fastapi import FastAPI, Request
 
@@ -7,7 +8,7 @@ from fastapi import FastAPI, Request
 from routers import documents, sendables
 
 # Настраиваем логирование (можно вынести в отдельный logging_config.py)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
 # Создаем приложение FastAPI
