@@ -27,39 +27,6 @@ logger = logging.getLogger(__name__)
 # Qdrant helper functions
 # ------------------------------------------------------------------------------
 
-def create_sparse_vector_doc_bm25(collection_name: str, text: str, k1: float = 1.2, b: float = 0.75) -> qmodels.SparseVector:
-    """
-    Create BM25 sparse vector for document indexing with full BM25 scoring.
-    
-    BM25 formula for documents:
-    weight(term) = IDF(term) * (f * (k1 + 1)) / (f + k1 * (1 - b + b * (dl / avgdl)))
-    
-    Args:
-        collection_name: Collection name for BM25 statistics tracking
-        text: Document text to vectorize
-        k1: BM25 saturation parameter (default: 1.2)
-        b: BM25 length normalization parameter (default: 0.75)
-    
-    Returns:
-        Qdrant SparseVector with BM25-weighted term scores
-    """
-    tokens = _tokenize_multilingual(text)
-    bm25_update_stats(collection_name, tokens)  # Update DF/N/AVGDL
-    
-    s = _get_stats(collection_name)
-    tf = Counter(tokens)
-    dl = sum(tf.values())  # Document length
-    
-    idx, val = [], []
-    for term, f in tf.items():
-        idf = _idf(term, s["N"], s["DF"])
-        denom = f + k1 * (1.0 - b + b * (dl / max(1.0, s["AVGDL"])))
-        w = idf * ((f * (k1 + 1.0)) / max(1e-9, denom))
-        idx.append(stable_hash(term))
-        val.append(float(w))
-    
-    return qmodels.SparseVector(indices=idx, values=val)
-
 def company_doc_collection(company_id: str, source: str = "general", agent_id: Optional[str] = None) -> str:
     """
     Get the collection name for company documents.
@@ -295,11 +262,36 @@ def create_sparse_vector_query_bm25(collection_name: str, text: str) -> qmodels.
     
     idx, val = [], []
     for term, f in tf.items():
-        w = f * _idf(term, s["N"], s["DF"])
+        idf = _idf(term, s["N"], s["DF"])
+        w = float(f) * float(idf)
         idx.append(stable_hash(term))
-        val.append(float(w))
+        val.append(w)
     
     return qmodels.SparseVector(indices=idx, values=val)
+
+def create_sparse_vector_doc_tf_norm(
+    collection_name: str,
+    text: str,
+    k1: float = 1.2,
+    b: float = 0.75,
+) -> qmodels.SparseVector:
+    tokens = _tokenize_multilingual(text)
+    tf = Counter(tokens)
+    dl = sum(tf.values())
+
+    # Read-only snapshot of avgdl (cached is fine)
+    s = _get_stats_cached(collection_name)
+    avgdl = max(1.0, float(s.get("AVGDL", 200.0)))
+
+    idx, val = [], []
+    norm = (1.0 - b + b * (dl / avgdl))
+    for term, f in tf.items():
+        denom = f + k1 * norm
+        w = (f * (k1 + 1.0)) / max(1e-9, denom)  # NO IDF in doc
+        idx.append(stable_hash(term))
+        val.append(float(w))
+
+    return qmodels.SparseVector(indices=idx, values=val), tokens
 
 def reciprocal_rank_fusion(
     dense_results: List[Dict[str, Any]], 

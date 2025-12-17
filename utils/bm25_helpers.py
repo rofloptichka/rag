@@ -57,7 +57,7 @@ def _tokenize_multilingual(text: str) -> list[str]:
             m = _RE_WORD.match(t, i)
             if m:
                 tok = m.group(0)
-                if len(tok) >= 2 or tok.isdigit() and tok not in _STOP_LATIN:
+                if (len(tok) >= 2 or tok.isdigit()) and tok not in _STOP_LATIN:
                     toks.append(tok)
                 i = m.end()
             else:
@@ -68,7 +68,7 @@ def _bm25_keys(coll: str) -> Dict[str, str]:
     """Generate Redis keys for BM25 statistics for a given collection."""
     return {
         "N": f"bm25:{coll}:N",        # Total number of documents
-        "AVGDL": f"bm25:{coll}:AVGDL",  # Average document length
+        "TOTAL_DL": f"bm25:{coll}:TOTAL_DL",  # Average document length
         "DF": f"bm25:{coll}:DF",       # Document frequency hash
     }
 
@@ -90,11 +90,7 @@ def bm25_update_stats_redis(coll: str, tokens: list[str]) -> None:
         
         # Increment total document count
         pipe.incr(keys["N"])
-        
-        # Update average document length using exponential moving average
-        avgdl_old = float(r.get(keys["AVGDL"]) or 200.0)
-        new_avg = 0.99 * avgdl_old + 0.01 * len(tokens)
-        pipe.set(keys["AVGDL"], new_avg)
+        pipe.incrby(keys["TOTAL_DL"], len(tokens))
         
         # Update document frequency for unique terms
         seen = set(tokens)
@@ -102,6 +98,8 @@ def bm25_update_stats_redis(coll: str, tokens: list[str]) -> None:
             pipe.hincrby(keys["DF"], t, 1)
         
         pipe.execute()
+        _bm25_stats_cache.pop(coll, None)
+        _bm25_cache_ttl.pop(coll, None)
         logger.debug(f"BM25 stats updated for collection '{coll}', doc_length={len(tokens)}")
     except Exception as e:
         logger.warning(f"Failed to update BM25 stats in Redis: {e}")
@@ -124,7 +122,7 @@ def _idf_redis(term: str, coll: str, eps: float = 0.5) -> float:
     try:
         keys = _bm25_keys(coll)
         N = int(r.get(keys["N"]) or 1)
-        df = int(r.hget(keys["DF"], term) or 1)
+        df = int(r.hget(keys["DF"], term) or 0)
         return math.log(1 + (N - df + eps) / (df + eps))
     except Exception as e:
         logger.warning(f"Failed to get IDF from Redis: {e}")
@@ -146,7 +144,8 @@ def _get_stats(coll: str) -> Dict[str, Any]:
     try:
         keys = _bm25_keys(coll)
         N = int(r.get(keys["N"]) or 1)
-        AVGDL = float(r.get(keys["AVGDL"]) or 200.0)
+        total_dl = int(r.get(keys["TOTAL_DL"]) or 200 * N)
+        AVGDL = float(total_dl) / max(1, N)
         # DF is a hash, we'll access it per-term when needed
         return {"N": N, "AVGDL": AVGDL, "DF": keys["DF"]}
     except Exception as e:
@@ -193,7 +192,7 @@ def _idf(term: str, N: int, DF_key: str, eps: float = 0.5) -> float:
         return 1.0
     
     try:
-        df = int(r.hget(DF_key, term) or 1)
+        df = int(r.hget(DF_key, term) or 0)
         return math.log(1 + (N - df + eps) / (df + eps))
     except Exception as e:
         logger.warning(f"Failed to calculate IDF: {e}")
@@ -231,27 +230,30 @@ def bm25_decrement_stats(coll: str, tokens: list[str]) -> None:
         if current_n > 1:
             pipe.decr(keys["N"])
 
-        # Adjust average document length using reverse exponential moving average
-        # This approximates removing the document's contribution to the average
-        avgdl_old = float(r.get(keys["AVGDL"]) or 200.0)
         doc_len = len(tokens)
-        # Reverse the EMA: if new_avg = 0.99 * old + 0.01 * doc_len
-        # then removing: new_avg ≈ (old - 0.01 * doc_len) / 0.99
-        # Simplified: just nudge it in the opposite direction
-        new_avg = max(50.0, 0.99 * avgdl_old - 0.01 * doc_len + 0.01 * avgdl_old)
-        pipe.set(keys["AVGDL"], new_avg)
+        pipe.incrby(keys["TOTAL_DL"], -doc_len)
 
         # Decrement document frequency for unique terms (but not below 1)
         seen = set(tokens)
         for t in seen:
-            current_df = int(r.hget(keys["DF"], t) or 1)
+            current_df = int(r.hget(keys["DF"], t) or 0)
             if current_df > 1:
                 pipe.hincrby(keys["DF"], t, -1)
             elif current_df == 1:
-                # Remove the term entirely if DF would become 0
                 pipe.hdel(keys["DF"], t)
 
         pipe.execute()
+        _bm25_stats_cache.pop(coll, None)
+        _bm25_cache_ttl.pop(coll, None)
+
+        total_dl = int(r.get(keys["TOTAL_DL"]) or 0)
+        if total_dl < 0:
+            r.set(keys["TOTAL_DL"], 0)
+
+        n = int(r.get(keys["N"]) or 1)
+        if n < 1:
+            r.set(keys["N"], 1)
+
         logger.debug(f"BM25 stats decremented for collection '{coll}', doc_length={doc_len}")
     except Exception as e:
         logger.warning(f"Failed to decrement BM25 stats in Redis: {e}")
@@ -275,7 +277,7 @@ def bm25_reset_stats(coll: str) -> None:
 
         # Delete all BM25 keys for this collection
         pipe.delete(keys["N"])
-        pipe.delete(keys["AVGDL"])
+        pipe.delete(keys["TOTAL_DL"])
         pipe.delete(keys["DF"])
 
         pipe.execute()
@@ -285,6 +287,7 @@ def bm25_reset_stats(coll: str) -> None:
             del _bm25_stats_cache[coll]
         if coll in _bm25_cache_ttl:
             del _bm25_cache_ttl[coll]
+        
 
         logger.info(f"BM25 stats reset for collection '{coll}'")
     except Exception as e:

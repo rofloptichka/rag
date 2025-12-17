@@ -36,8 +36,9 @@ load_dotenv()
 from qdrant_client.http import models as qmodels
 from config import qdrant, EMBED_DIMS, bucket
 from utils.qdrant_helpers import (
-    embed_texts, sha_id, create_sparse_vector_doc_bm25,
-    company_doc_collection, company_sendable_collection
+    embed_texts, sha_id,
+    company_doc_collection, company_sendable_collection,
+    create_sparse_vector_doc_tf_norm
 )
 from utils.bm25_helpers import bm25_reset_stats
 
@@ -247,7 +248,7 @@ def reindex_from_backup(collection_name: str, backup: List[Dict[str, Any]], batc
             sparse_source = f"{title}. {text}" if title else text
 
             # Create sparse vector
-            sparse_vec = create_sparse_vector_doc_bm25(collection_name, sparse_source)
+            sparse_vec, tokens = create_sparse_vector_doc_tf_norm(collection_name, sparse_source)
 
             point = qmodels.PointStruct(
                 id=item["id"],

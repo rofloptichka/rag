@@ -29,7 +29,7 @@ from utils.processing import (
 from utils.qdrant_helpers import (
     sha_id, embed_texts, get_company_sendable_table, get_cached_query_embedding,
     create_sparse_vector_query_bm25, _weighted_rrf, _tokenize_multilingual,
-    create_sparse_vector_doc_bm25
+    create_sparse_vector_doc_tf_norm
 )
 
 from utils.reranker import rerank_with_openai, rerank_with_jina # и т.д.
@@ -182,8 +182,8 @@ async def process_sendable_file(
     
     point_id = sha_id(companyId, "sendable", safe_name)
     
-    # Build point with named dense and sparse vectors using BM25
-    sparse_vec = create_sparse_vector_doc_bm25(table, description)
+    # Build point with named dense and sparse vectors using TF-norm
+    sparse_vec, _ = create_sparse_vector_doc_tf_norm(table, description)
     
     # IMPORTANT: Pass both dense and sparse vectors in the vector parameter
     point = qmodels.PointStruct(
@@ -283,8 +283,8 @@ async def update_sendable_description(
     payload = point.payload or {}
     payload["text"] = new_description
     
-    # Build point with named dense + sparse vectors using BM25
-    new_sparse = create_sparse_vector_doc_bm25(table, new_description)
+    # Build point with named dense + sparse vectors using TF-norm
+    new_sparse, _ = create_sparse_vector_doc_tf_norm(table, new_description)
     
     updated_point = qmodels.PointStruct(
         id=point.id,

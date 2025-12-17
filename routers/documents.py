@@ -30,10 +30,10 @@ from utils.qdrant_helpers import (
     get_company_doc_table, sha_id, embed_texts,
     get_cached_query_embedding, get_cached_query_embedding_async,
     _weighted_rrf, _tokenize_multilingual, _emb_cache,
-    create_sparse_vector_doc_bm25, create_sparse_vector_query_bm25
+    create_sparse_vector_query_bm25, create_sparse_vector_doc_tf_norm
 )
 from utils.bm25_helpers import bm25_decrement_stats, _tokenize_multilingual as bm25_tokenize
-
+from utils.bm25_helpers import bm25_update_stats
 from utils.reranker import rerank_with_openai, rerank_with_jina # и т.д.
 from utils.vlm_converter import convert_with_vlm_fallback
 
@@ -204,6 +204,7 @@ async def process_document(
                 # Prepare chunks for storage and log each
                 yield _sse_format("status", {"step": "prepare", "message": "Preparing chunks for storage"})
                 to_store = []
+
                 if use_natural and isinstance(chunks, list) and chunks and isinstance(chunks[0], dict):
                     for i, ch in enumerate(chunks):
                         item = {
@@ -256,6 +257,7 @@ async def process_document(
                 
                 # Build points with both dense and sparse vectors (Qdrant-only)
                 points = []
+                all_tokens = [] # For BM25 stats update
                 for i, (item, dense_vec) in enumerate(zip(to_store, dense_vectors)):
                     point_id = sha_id(companyId, safe_filename, str(i))
                     
@@ -267,9 +269,8 @@ async def process_document(
                     # Build point with named dense and sparse vectors
                     title = (item.get("metadata") or {}).get("title")
                     sparse_source = f"{title}. {item['text']}" if title else item["text"]
-                    sparse_vec = create_sparse_vector_doc_bm25(table, sparse_source)
-                    # Log tokens being indexed
-                    tokens = _tokenize_multilingual(sparse_source)
+                    sparse_vec, tokens = create_sparse_vector_doc_tf_norm(table, sparse_source)
+                    all_tokens.append(tokens)
                     logger.info(f"Tokens for chunk {i}: {tokens[:20]}{'...' if len(tokens) > 20 else ''} (total {len(tokens)} tokens)")
                     # IMPORTANT: Pass both dense and sparse vectors in the vector parameter
                     point = qmodels.PointStruct(
@@ -278,16 +279,21 @@ async def process_document(
                             "dense": dense_vec,
                             "sparse": qmodels.SparseVector(
                                 indices=sparse_vec.indices,
-                                values=sparse_vec.values
-                            )
+                                values=sparse_vec.values),
                         },
                         payload=payload
                     )
                     points.append(point)
                 
                 qdrant.upsert(collection_name=table, wait=True, points=points)
+
+                
                 total_count = qdrant.count(collection_name=table, exact=False).count
                 
+                for tokens in all_tokens:
+                    bm25_update_stats(table, tokens)
+
+
                 yield _sse_format("done", {
                     "message": "Document processed and embeddings stored successfully.",
                     "row_count": int(total_count),
@@ -428,6 +434,7 @@ async def process_document(
         
         # Build points with both dense and sparse vectors (Qdrant-only)
         points = []
+        all_tokens = [] # For BM25 stats update
         for i, (item, dense_vec) in enumerate(zip(to_store, dense_vectors)):
             point_id = sha_id(companyId, safe_filename, str(i))
             
@@ -439,9 +446,9 @@ async def process_document(
             # Build point with named dense and sparse vectors
             title = (item.get("metadata") or {}).get("title")
             sparse_source = f"{title}. {item['text']}" if title else item["text"]
-            sparse_vec = create_sparse_vector_doc_bm25(table, sparse_source)
+            sparse_vec, tokens = create_sparse_vector_doc_tf_norm(table, sparse_source)
             # Log tokens being indexed
-            tokens = _tokenize_multilingual(sparse_source)
+            all_tokens.append(tokens)
             logger.info(f"Tokens for chunk {i}: {tokens[:20]}{'...' if len(tokens) > 20 else ''} (total {len(tokens)} tokens)")
             # IMPORTANT: Pass both dense and sparse vectors in the vector parameter
             point = qmodels.PointStruct(
@@ -459,6 +466,9 @@ async def process_document(
         
         qdrant.upsert(collection_name=table, wait=True, points=points)
         total_count = qdrant.count(collection_name=table, exact=False).count
+
+        for tokens in all_tokens:
+            bm25_update_stats(table, tokens)    
         
         response_obj = {
             "message": "Document processed and embeddings stored successfully.",
@@ -606,6 +616,15 @@ async def search_documents(
             
             dense_results = format_hits(dense_hits)
             sparse_results = format_hits(sparse_hits)
+            
+            # Log dense and sparse results for comparison
+            logger.info(f"DENSE RESULTS ({len(dense_results)} hits):")
+            for i, result in enumerate(dense_results):
+                logger.info(f"  [{i}] score={result['score']:.4f} | file={result['filename']} | title={result['title']} | text_preview={result['text'][:80]}")
+            
+            logger.info(f"SPARSE RESULTS ({len(sparse_results)} hits):")
+            for i, result in enumerate(sparse_results):
+                logger.info(f"  [{i}] score={result['score']:.4f} | file={result['filename']} | title={result['title']} | text_preview={result['text'][:80]}")
             
             # Apply weighted RRF fusion (boost sparse for short queries)
             q_toks = _tokenize_multilingual(query)
