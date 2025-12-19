@@ -526,14 +526,23 @@ def run_smart_chunking_pipeline(
     enhanced_text = text
     if llm_enhance:
         try:
+            print(f"[Smart Chunking] Starting LLM enhancement with {len(text)} characters...")
             enhanced_text = _enhance_text_with_llm(text)
+            if enhanced_text != text:
+                print(f"[Smart Chunking] LLM enhancement injected headers! New length: {len(enhanced_text)}")
+            else:
+                print("[Smart Chunking] LLM enhancement finished but no headers were injected.")
         except Exception as e:
             print(f"[Smart Chunking] LLM enhancement failed, using original text: {e}")
     
+    print(f"[Smart Chunking] Extracting sections from {'enhanced' if llm_enhance else 'original'} markdown...")
     sections = _extract_sections_from_markdown(enhanced_text)
+    print(f"[Smart Chunking] Found {len(sections)} sections. Building semantic chunks...")
     chunks = _build_semantic_chunks(sections, max_tokens)
+    print(f"[Smart Chunking] Created {len(chunks)} semantic chunks.")
     
     return chunks
+
 
 def safe_decode_filename(filename: str) -> str:
     """Fixes improperly decoded filenames with robust error handling."""
