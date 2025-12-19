@@ -355,12 +355,6 @@ async def process_document(
         # Use markdown directly from Docling (no LLM restructuring)
         final_markdown = markdown_output
 
-        # Extract sections
-        sections = _extract_sections_from_markdown(final_markdown)
-
-        # Optional LLM understanding
-        insights = _llm_understand_sections(sections) if use_llm else None
-
         # Chunking (Smart Chunking Pipeline)
         try:
             chunks = run_smart_chunking_pipeline(
@@ -471,8 +465,6 @@ async def process_document(
             "natural": bool(use_natural),
             "llm": bool(use_llm),
         }
-        if use_llm and insights:
-            response_obj["insights_preview"] = insights.get("sections", [])[:2]
         return response_obj
         
     except Exception as e:
