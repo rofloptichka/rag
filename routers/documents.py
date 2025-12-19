@@ -23,8 +23,8 @@ from config import (
     converter, chunker
 )
 from utils.processing import (
-    safe_decode_filename, upload_to_gcs,
-    _extract_sections_from_markdown, _build_natural_chunks, _llm_understand_sections, _sse_format
+    safe_decode_filename, upload_to_gcs, run_smart_chunking_pipeline,
+    _extract_sections_from_markdown, _llm_understand_sections, _sse_format
 )
 from utils.qdrant_helpers import (
     get_company_doc_table, sha_id, embed_texts,
@@ -183,20 +183,31 @@ async def process_document(
                     insights = _llm_understand_sections(sections)
                     yield _sse_format("debug", {"insights_preview": insights.get("sections", [])[:2] if insights else None})
 
-                # Chunking
-                yield _sse_format("status", {"step": "chunking", "message": "Building chunks"})
-                chunks = None
-                if use_natural:
-                    try:
-                        chunks = _build_natural_chunks(sections, soft_cap, hard_cap)
-                        yield _sse_format("debug", {"natural_chunks": len(chunks)})
-                    except Exception as nerr:
-                        yield _sse_format("warn", {"message": f"Natural chunking failed, fallback: {str(nerr)}"})
-                if chunks is None:
+                # Chunking (Smart Chunking Pipeline)
+                yield _sse_format("status", {"step": "chunking", "message": "Running Smart Chunking pipeline"})
+                try:
+                    chunks = run_smart_chunking_pipeline(
+                        text=final_markdown,
+                        llm_enhance=use_llm,
+                        max_tokens=hard_cap,
+                    )
+                    yield _sse_format("debug", {"smart_chunks": len(chunks)})
+                except Exception as nerr:
+                    yield _sse_format("warn", {"message": f"Smart chunking failed, fallback: {str(nerr)}"})
                     chunker = HybridChunker(tokenizer=tokenizer, max_tokens=MAX_TOKENS, merge_peers=True)
                     dl_chunks = list(chunker.chunk(dl_doc=document))
-                    chunks = dl_chunks
-                    yield _sse_format("debug", {"hybrid_chunks": len(dl_chunks)})
+                    # Convert Docling chunks to dict format
+                    chunks = []
+                    for i, chunk in enumerate(dl_chunks):
+                        page_nums = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}) or []
+                        chunks.append({
+                            "text": chunk.text,
+                            "section_title": chunk.meta.headings[0] if chunk.meta.headings else None,
+                            "parent_id": f"docling_{i}",
+                            "parent_text": chunk.text,
+                            "page_numbers": page_nums or None,
+                        })
+                    yield _sse_format("debug", {"hybrid_chunks": len(chunks)})
 
                 if not chunks:
                     raise ValueError("No chunks were created from the document")
@@ -205,36 +216,21 @@ async def process_document(
                 yield _sse_format("status", {"step": "prepare", "message": "Preparing chunks for storage"})
                 to_store = []
 
-                if use_natural and isinstance(chunks, list) and chunks and isinstance(chunks[0], dict):
-                    for i, ch in enumerate(chunks):
-                        item = {
-                            "text": ch.get("text", ""),
-                            "metadata": {
-                                "filename": safe_filename,
-                                "page_numbers": None,
-                                "title": ch.get("section_title"),
-                                "url": gcs_url,
-                            },
-                        }
-                        to_store.append(item)
-                        logger.info(f"Indexing chunk {i}: title='{item['metadata']['title']}', text_preview='{item['text'][:100]}...'")
-                        yield _sse_format("chunk", {"index": i, "title": item["metadata"]["title"], "preview": item["text"][:160]})
-                else:
-                    for i, chunk in enumerate(chunks):
-                        page_nums = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}) or []
-                        page_nums_str = json.dumps(page_nums) if page_nums else None
-                        item = {
-                            "text": chunk.text,
-                            "metadata": {
-                                "filename": safe_filename,
-                                "page_numbers": page_nums_str,
-                                "title": chunk.meta.headings[0] if chunk.meta.headings else None,
-                                "url": gcs_url,
-                            },
-                        }
-                        to_store.append(item)
-                        logger.info(f"Indexing chunk {i}: title='{item['metadata']['title']}', text_preview='{item['text'][:100]}...'")
-                        yield _sse_format("chunk", {"index": i, "title": item["metadata"]["title"], "preview": item["text"][:160], "pages": page_nums})
+                for i, ch in enumerate(chunks):
+                    item = {
+                        "text": ch.get("text", ""),
+                        "parent_id": ch.get("parent_id"),
+                        "parent_text": ch.get("parent_text"),
+                        "metadata": {
+                            "filename": safe_filename,
+                            "page_numbers": ch.get("page_numbers"),
+                            "title": ch.get("section_title"),
+                            "url": gcs_url,
+                        },
+                    }
+                    to_store.append(item)
+                    logger.info(f"Indexing chunk {i}: title='{item['metadata']['title']}', parent_id='{item['parent_id']}', text_preview='{item['text'][:100]}...'")
+                    yield _sse_format("chunk", {"index": i, "title": item["metadata"]["title"], "parent_id": item["parent_id"], "preview": item["text"][:160]})
 
                 if not to_store:
                     raise ValueError("No chunks were prepared for storage")
@@ -263,6 +259,8 @@ async def process_document(
                     
                     payload = {
                         "text": item["text"],
+                        "parent_id": item.get("parent_id"),
+                        "parent_text": item.get("parent_text"),
                         "metadata": item["metadata"]
                     }
                     
@@ -363,58 +361,52 @@ async def process_document(
         # Optional LLM understanding
         insights = _llm_understand_sections(sections) if use_llm else None
 
-        # Chunking
-        chunks = None
-        if use_natural:
-            try:
-                chunks = _build_natural_chunks(sections, soft_cap, hard_cap)
-            except Exception as nerr:
-                print(f"Natural chunking failed, fallback: {nerr}")
-        if chunks is None:
+        # Chunking (Smart Chunking Pipeline)
+        try:
+            chunks = run_smart_chunking_pipeline(
+                text=final_markdown,
+                llm_enhance=use_llm,
+                max_tokens=hard_cap,
+            )
+        except Exception as nerr:
+            print(f"Smart chunking failed, fallback: {nerr}")
             chunker = HybridChunker(tokenizer=tokenizer, max_tokens=MAX_TOKENS, merge_peers=True)
-            chunks = list(chunker.chunk(dl_doc=document))
+            dl_chunks = list(chunker.chunk(dl_doc=document))
+            # Convert Docling chunks to dict format
+            chunks = []
+            for i, chunk in enumerate(dl_chunks):
+                page_nums = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}) or []
+                chunks.append({
+                    "text": chunk.text,
+                    "section_title": chunk.meta.headings[0] if chunk.meta.headings else None,
+                    "parent_id": f"docling_{i}",
+                    "parent_text": chunk.text,
+                    "page_numbers": page_nums or None,
+                })
 
         if not chunks:
             raise ValueError("No chunks were created from the document")
 
         # Prepare chunks for storage with logging
         to_store = []
-        if use_natural and isinstance(chunks, list) and chunks and isinstance(chunks[0], dict):
-            for i, ch in enumerate(chunks):
-                item = {
-                    "text": ch.get("text", ""),
-                    "metadata": {
-                        "filename": safe_filename,
-                        "page_numbers": None,
-                        "title": ch.get("section_title"),
-                        "url": gcs_url,
-                    },
-                }
-                to_store.append(item)
-                logger.info(f"Indexing chunk {i}: title='{item['metadata']['title']}', text_preview='{item['text'][:100]}...'")
-                try:
-                    print({"chunk_index": i, "title": item["metadata"]["title"], "preview": item["text"][:160]})
-                except Exception:
-                    pass  # Ignore print errors
-        else:
-            for i, chunk in enumerate(chunks):
-                page_nums = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}) or []
-                page_nums_str = json.dumps(page_nums) if page_nums else None
-                item = {
-                    "text": chunk.text,
-                    "metadata": {
-                        "filename": safe_filename,
-                        "page_numbers": page_nums_str,
-                        "title": chunk.meta.headings[0] if chunk.meta.headings else None,
-                        "url": gcs_url,
-                    },
-                }
-                to_store.append(item)
-                logger.info(f"Indexing chunk {i}: title='{item['metadata']['title']}', text_preview='{item['text'][:100]}...'")
-                try:
-                    print({"chunk_index": i, "title": item["metadata"]["title"], "preview": item["text"][:160], "pages": page_nums})
-                except Exception:
-                    pass  # Ignore print errors
+        for i, ch in enumerate(chunks):
+            item = {
+                "text": ch.get("text", ""),
+                "parent_id": ch.get("parent_id"),
+                "parent_text": ch.get("parent_text"),
+                "metadata": {
+                    "filename": safe_filename,
+                    "page_numbers": ch.get("page_numbers"),
+                    "title": ch.get("section_title"),
+                    "url": gcs_url,
+                },
+            }
+            to_store.append(item)
+            logger.info(f"Indexing chunk {i}: title='{item['metadata']['title']}', parent_id='{item['parent_id']}', text_preview='{item['text'][:100]}...'")
+            try:
+                print({"chunk_index": i, "title": item["metadata"]["title"], "parent_id": item["parent_id"], "preview": item["text"][:160]})
+            except Exception:
+                pass  # Ignore print errors
 
         if not to_store:
             raise ValueError("No chunks were prepared for storage")
@@ -440,6 +432,8 @@ async def process_document(
             
             payload = {
                 "text": item["text"],
+                "parent_id": item.get("parent_id"),
+                "parent_text": item.get("parent_text"),
                 "metadata": item["metadata"]
             }
             
@@ -606,6 +600,8 @@ async def search_documents(
                     results.append({
                         "id": str(hit.id),
                         "text": pl.get("text"),
+                        "parent_id": pl.get("parent_id"),
+                        "parent_text": pl.get("parent_text"),
                         "filename": md.get("filename"),
                         "page_numbers": page_numbers,
                         "title": md.get("title"),
@@ -669,6 +665,8 @@ async def search_documents(
                 initial_results.append({
                     "id": str(hit.id),
                     "text": pl.get("text"),
+                    "parent_id": pl.get("parent_id"),
+                    "parent_text": pl.get("parent_text"),
                     "filename": md.get("filename"),
                     "page_numbers": page_numbers,
                     "title": md.get("title"),
@@ -729,12 +727,40 @@ async def search_documents(
     else:
         final_results = initial_results[:limit]
     
+    # 5) Deduplicate by parent_id - Small-to-Big Retrieval
+    # Return unique parents with highest score among their children
+    seen_parent_ids = set()
+    deduplicated_results = []
+    for result in final_results:
+        parent_id = result.get("parent_id")
+        if parent_id:
+            if parent_id in seen_parent_ids:
+                continue  # Skip duplicate parent
+            seen_parent_ids.add(parent_id)
+            # Replace child text with parent_text for LLM context
+            deduplicated_results.append({
+                "id": result["id"],
+                "text": result.get("parent_text") or result.get("text"),  # Use parent_text for LLM
+               # "child_text": result.get("text"),  # Keep original child for reference
+                "parent_id": parent_id,
+                "filename": result.get("filename"),
+                "page_numbers": result.get("page_numbers"),
+                "title": result.get("title"),
+                "url": result.get("url"),
+                "score": result.get("score", 0.0),
+            })
+        else:
+            # No parent_id (legacy data or fallback), include as-is
+            deduplicated_results.append(result)
+    
     total_time_ms = int((time.perf_counter() - search_start) * 1000)
-    logger.info(f"Search completed in {total_time_ms}ms for query: '{query[:50]}...'")
+    logger.info(f"Search completed in {total_time_ms}ms for query: '{query[:50]}...', {len(final_results)} children -> {len(deduplicated_results)} unique parents")
     
     return {
-        "results": final_results,
+        "results": deduplicated_results,
         "search_time_ms": total_time_ms,
+        "children_count": len(final_results),
+        "parents_count": len(deduplicated_results),
         **rerank_metadata
     }
 

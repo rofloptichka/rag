@@ -64,12 +64,12 @@ def _sse_format(event: str, data: Any) -> str:
 ## Reranker moved to utils/reranker.py
 
 # ------------------------------------------------------------------------------
-# Markdown-based section/paragraph extraction
+# Markdown-based section/paragraph extraction (Code-Block Safe)
 # ------------------------------------------------------------------------------
 def _extract_sections_from_markdown(md: str) -> List[Dict[str, Any]]:
     """
-    Parse markdown into sections and paragraphs. We keep it conservative and
-    language-agnostic. Returns a list of sections:
+    Parse markdown into sections and paragraphs. IGNORES headers inside code blocks.
+    Returns a list of sections:
       [{
           'title': str,
           'level': int,  # heading level 1..6
@@ -81,11 +81,15 @@ def _extract_sections_from_markdown(md: str) -> List[Dict[str, Any]]:
     """
     lines = md.splitlines()
     sections: List[Dict[str, Any]] = []
+    
     current_title = None
     current_level = 1
     current_paragraph_lines: List[str] = []
     section_idx = -1
     para_idx = 0
+    
+    # Flag: are we inside a ``` code block?
+    in_code_block = False 
 
     def _flush_paragraph():
         nonlocal para_idx, current_paragraph_lines
@@ -111,36 +115,48 @@ def _extract_sections_from_markdown(md: str) -> List[Dict[str, Any]]:
         para_idx = 0
 
     for ln in lines:
-        # Heading detection (e.g., #, ##, ###)
+        stripped_ln = ln.strip()
+        
+        # 1. Detect code block boundaries
+        if stripped_ln.startswith("```"):
+            in_code_block = not in_code_block
+            # Code block is part of the current paragraph
+            if section_idx < 0: _start_new_section(None, 1)
+            current_paragraph_lines.append(ln)
+            continue
+
+        # 2. If inside code block, IGNORE header detection
+        if in_code_block:
+            if section_idx < 0: _start_new_section(None, 1)
+            current_paragraph_lines.append(ln)
+            continue
+
+        # 3. Heading detection (ONLY if not in code)
         m = re.match(r"^(#{1,6})\s+(.*)$", ln)
         if m:
-            # Finish previous paragraph before starting a new section
             _flush_paragraph()
             current_title = m.group(2).strip()
             current_level = len(m.group(1))
             _start_new_section(current_title, current_level)
             continue
 
-        # Blank line => paragraph boundary
+        # 4. Blank line => paragraph boundary
         if not ln.strip():
             _flush_paragraph()
             continue
 
-        # Accumulate paragraph lines; start default section if none yet
+        # 5. Normal text
         if section_idx < 0:
             _start_new_section(title=None, level=1)
         current_paragraph_lines.append(ln)
 
-    # Flush tail
     _flush_paragraph()
 
-    # If no sections at all, create one default section from entire text
     if not sections and md.strip():
         sections = [{
-            "title": None,
-            "level": 1,
-            "paragraphs": [{"text": md.strip(), "para_idx": 0}],
-            "section_idx": 0,
+            "title": None, "level": 1, 
+            "paragraphs": [{"text": md.strip(), "para_idx": 0}], 
+            "section_idx": 0
         }]
     return sections
 
@@ -281,6 +297,243 @@ def _llm_understand_sections(sections: List[Dict[str, Any]], max_sections: int =
             # Non-blocking: ignore failures
             continue
     return insights
+
+# ------------------------------------------------------------------------------
+# Safe Chunk Generator (for LLM Windowing)
+# ------------------------------------------------------------------------------
+from typing import Iterator
+import hashlib
+from pydantic import BaseModel
+
+def safe_chunk_generator(text: str, chunk_size: int = 3000) -> Iterator[str]:
+    """
+    Yields chunks of text, splitting only at paragraph boundaries (\n\n).
+    Ensures LLM inputs are always complete paragraphs.
+    """
+    if not text:
+        return
+    
+    remainder = ""
+    pos = 0
+    text_len = len(text)
+    
+    while pos < text_len:
+        end_pos = min(pos + chunk_size, text_len)
+        chunk = remainder + text[pos:end_pos]
+        
+        if end_pos >= text_len:
+            if chunk.strip():
+                yield chunk
+            break
+        
+        last_break = chunk.rfind("\n\n")
+        
+        if last_break > 0:
+            yield chunk[:last_break]
+            remainder = chunk[last_break:].lstrip("\n")
+        else:
+            yield chunk
+            remainder = ""
+        
+        pos = end_pos
+
+# ------------------------------------------------------------------------------
+# Recursive text splitter for large sections
+# ------------------------------------------------------------------------------
+def _recursive_split_text(text: str, max_tokens: int) -> List[str]:
+    """Recursively splits text by \n\n, then \n, then '. ' to respect token limits."""
+    if _count_tokens(text) <= max_tokens:
+        return [text]
+    
+    parts = text.split("\n\n")
+    if len(parts) > 1:
+        return _split_and_merge(parts, max_tokens, "\n\n")
+    
+    parts = text.split("\n")
+    if len(parts) > 1:
+        return _split_and_merge(parts, max_tokens, "\n")
+    
+    parts = text.split(". ")
+    if len(parts) > 1:
+        parts = [p + "." if i < len(parts) - 1 else p for i, p in enumerate(parts)]
+        return _split_and_merge(parts, max_tokens, " ")
+    
+    return [text]
+
+def _split_and_merge(parts: List[str], max_tokens: int, separator: str) -> List[str]:
+    """Merge parts back together respecting max_tokens."""
+    result = []
+    current_chunk = ""
+    
+    for part in parts:
+        test_chunk = current_chunk + separator + part if current_chunk else part
+        if _count_tokens(test_chunk) <= max_tokens:
+            current_chunk = test_chunk
+        else:
+            if current_chunk:
+                result.append(current_chunk)
+            if _count_tokens(part) > max_tokens:
+                result.extend(_recursive_split_text(part, max_tokens))
+                current_chunk = ""
+            else:
+                current_chunk = part
+    
+    if current_chunk:
+        result.append(current_chunk)
+    
+    return result
+
+# ------------------------------------------------------------------------------
+# Semantic Parent-Child Chunking
+# ------------------------------------------------------------------------------
+def _build_semantic_chunks(
+    sections: List[Dict[str, Any]],
+    max_tokens: int = 512,
+) -> List[Dict[str, Any]]:
+    """
+    Build chunks using Parent-Child strategy:
+    - Parent = Full section text
+    - If section <= max_tokens: 1 chunk (child = parent)
+    - If section > max_tokens: Split into children, all referencing same parent
+    
+    Returns list of chunks with parent_id and parent_text for Small-to-Big retrieval.
+    """
+    chunks: List[Dict[str, Any]] = []
+
+    for section in sections:
+        section_title = section.get("title")
+        parent_text = "\n\n".join(p.get("text", "") for p in section.get("paragraphs", []))
+        if not parent_text.strip():
+            continue
+        
+        parent_id = hashlib.md5(f"{section_title or ''}:{parent_text}".encode()).hexdigest()[:16]
+        parent_tokens = _count_tokens(parent_text)
+        
+        if parent_tokens <= max_tokens:
+            chunks.append({
+                "text": parent_text,
+                "section_title": section_title,
+                "parent_id": parent_id,
+                "parent_text": parent_text,
+            })
+        else:
+            child_texts = _recursive_split_text(parent_text, max_tokens)
+            for child_text in child_texts:
+                chunks.append({
+                    "text": child_text,
+                    "section_title": section_title,
+                    "parent_id": parent_id,
+                    "parent_text": parent_text,
+                })
+    
+    return chunks
+
+# ------------------------------------------------------------------------------
+# LLM Split-Stitch Enhancement
+# ------------------------------------------------------------------------------
+class SplitPoint(BaseModel):
+    start_snippet: str  # 15-20 words verbatim from text
+    title: str          # Generated markdown header
+
+def _identify_split_points_llm(chunk_text: str) -> List[SplitPoint]:
+    """Call LLM to identify semantic topic shifts in a chunk."""
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": (
+                    "You are a document structure analyst. Find semantic topic shifts in the text. "
+                    "For each new logical section, provide: "
+                    "1. start_snippet: The FIRST 15-20 words of the sentence where the new section starts (VERBATIM copy). "
+                    "2. title: A markdown header title (e.g., '## Cancellation Policy'). "
+                    "Ignore hashtags, code comments, existing headers. Return JSON array."
+                )},
+                {"role": "user", "content": f"Find topic shifts in this text:\n\n{chunk_text}"},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content if resp.choices else None
+        if not content:
+            return []
+        
+        data = json.loads(content)
+        points = data.get("split_points", data.get("sections", []))
+        return [SplitPoint(start_snippet=p.get("start_snippet", ""), title=p.get("title", "")) 
+                for p in points if p.get("start_snippet")]
+    except Exception as e:
+        print(f"[LLM Split] Error: {e}")
+        return []
+
+def _stitch_text_with_headers(raw_text: str, split_points: List[SplitPoint]) -> str:
+    """Insert headers into raw_text at positions identified by split_points."""
+    if not split_points:
+        return raw_text
+    
+    result_parts = []
+    cursor = 0
+    
+    for point in split_points:
+        if not point.start_snippet:
+            continue
+        
+        found_idx = raw_text.find(point.start_snippet, cursor)
+        if found_idx == -1:
+            partial = point.start_snippet[:50]
+            found_idx = raw_text.find(partial, cursor)
+        
+        if found_idx != -1:
+            result_parts.append(raw_text[cursor:found_idx])
+            result_parts.append(f"\n\n{point.title}\n\n")
+            cursor = found_idx
+    
+    result_parts.append(raw_text[cursor:])
+    return "".join(result_parts)
+
+def _enhance_text_with_llm(text: str, chunk_size: int = 3000) -> str:
+    """Enhance raw markdown by identifying and inserting semantic headers."""
+    all_split_points: List[SplitPoint] = []
+    
+    for chunk in safe_chunk_generator(text, chunk_size):
+        points = _identify_split_points_llm(chunk)
+        all_split_points.extend(points)
+    
+    if not all_split_points:
+        return text
+    
+    return _stitch_text_with_headers(text, all_split_points)
+
+# ------------------------------------------------------------------------------
+# Main Pipeline Wrapper
+# ------------------------------------------------------------------------------
+def run_smart_chunking_pipeline(
+    text: str,
+    llm_enhance: bool = True,
+    max_tokens: int = 512,
+) -> List[Dict[str, Any]]:
+    """
+    Full Smart Chunking pipeline:
+    1. (Optional) Enhance text with LLM-identified headers
+    2. Extract sections using code-block-safe parser
+    3. Build semantic chunks with Parent-Child structure
+    
+    Returns list of chunks ready for indexing, each containing:
+    - text: The chunk text (for embedding)
+    - section_title: Header/title of the section
+    - parent_id: Unique ID for the parent section (for deduplication)
+    - parent_text: Full parent section text (for Small-to-Big retrieval)
+    """
+    enhanced_text = text
+    if llm_enhance:
+        try:
+            enhanced_text = _enhance_text_with_llm(text)
+        except Exception as e:
+            print(f"[Smart Chunking] LLM enhancement failed, using original text: {e}")
+    
+    sections = _extract_sections_from_markdown(enhanced_text)
+    chunks = _build_semantic_chunks(sections, max_tokens)
+    
+    return chunks
 
 def safe_decode_filename(filename: str) -> str:
     """Fixes improperly decoded filenames with robust error handling."""
