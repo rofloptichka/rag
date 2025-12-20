@@ -429,28 +429,86 @@ def _build_semantic_chunks(
     return chunks
 
 # ------------------------------------------------------------------------------
-# LLM Split-Stitch Enhancement
+# LLM Split-Stitch Enhancement (Line-Index Based with Fuzzy Matching)
 # ------------------------------------------------------------------------------
-class SplitPoint(BaseModel):
-    start_snippet: str  # 15-20 words verbatim from text
-    title: str          # Generated markdown header
+from difflib import SequenceMatcher
 
-def _identify_split_points_llm(chunk_text: str) -> List[SplitPoint]:
-    """Call LLM to identify semantic topic shifts in a chunk."""
+class SplitPoint(BaseModel):
+    line_number: int    # 1-based line number where section starts
+    title: str          # Generated markdown header
+    confidence: float = 1.0  # How confident we are in this split
+
+def _normalize_text(text: str) -> str:
+    """Normalize text for fuzzy comparison."""
+    return re.sub(r'\s+', ' ', text.lower().strip())
+
+def _find_best_line_match(lines: List[str], target_snippet: str, start_line: int = 0) -> tuple[int, float]:
+    """
+    Find the line that best matches the target snippet using fuzzy matching.
+    Returns (line_index, confidence_score).
+    """
+    if not target_snippet:
+        return -1, 0.0
+    
+    normalized_target = _normalize_text(target_snippet)
+    best_match = -1
+    best_score = 0.0
+    
+    # Search within a reasonable window
+    for i in range(start_line, min(start_line + 100, len(lines))):
+        line = lines[i]
+        if not line.strip():
+            continue
+        
+        normalized_line = _normalize_text(line)
+        
+        # Check if target is contained in line or vice versa
+        if normalized_target in normalized_line or normalized_line in normalized_target:
+            score = 0.95
+        else:
+            # Use SequenceMatcher for fuzzy comparison
+            score = SequenceMatcher(None, normalized_target[:100], normalized_line[:100]).ratio()
+        
+        if score > best_score and score > 0.6:  # Minimum threshold
+            best_score = score
+            best_match = i
+    
+    return best_match, best_score
+
+def _identify_split_points_llm(lines: List[str], start_line: int, end_line: int) -> List[SplitPoint]:
+    """
+    Call LLM to identify semantic topic shifts in a chunk of lines.
+    Uses line numbers for precise positioning.
+    """
+    # Build numbered text for LLM
+    numbered_lines = []
+    for i in range(start_line, min(end_line, len(lines))):
+        numbered_lines.append(f"[L{i+1}] {lines[i]}")
+    
+    chunk_text = "\n".join(numbered_lines)
+    if not chunk_text.strip():
+        return []
+    
     try:
         resp = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": (
-                    "You are a document structure analyst. Find semantic topic shifts in the text. "
-                    "For each new logical section, provide: "
-                    "1. start_snippet: The FIRST 15-20 words of the sentence where the new section starts (VERBATIM copy). "
-                    "2. title: A markdown header title (e.g., '## Cancellation Policy'). "
-                    "Ignore hashtags, code comments, existing headers. Return JSON array."
+                    "You are a document structure analyst. Analyze the numbered text and find semantic topic shifts.\n\n"
+                    "For each NEW logical section (not existing headers), provide:\n"
+                    "1. line_number: The line number [Lxx] where the new topic STARTS\n"
+                    "2. title: A markdown header (e.g., '## Cancellation Policy')\n"
+                    "3. first_words: First 5-10 words of that line (for verification)\n\n"
+                    "Rules:\n"
+                    "- Only identify MAJOR topic shifts, not every paragraph\n"
+                    "- Skip lines that already have markdown headers (starting with #)\n"
+                    "- Skip code blocks and technical formatting\n"
+                    "- Return empty array if no clear topic shifts found\n\n"
+                    "Return JSON: {\"split_points\": [{\"line_number\": int, \"title\": str, \"first_words\": str}]}"
                 )},
-                {"role": "user", "content": f"Find topic shifts in this text:\n\n{chunk_text}"},
+                {"role": "user", "content": f"Find topic shifts:\n\n{chunk_text}"},
             ],
-            temperature=0.2,
+            temperature=0.1,
             response_format={"type": "json_object"},
         )
         content = resp.choices[0].message.content if resp.choices else None
@@ -458,50 +516,126 @@ def _identify_split_points_llm(chunk_text: str) -> List[SplitPoint]:
             return []
         
         data = json.loads(content)
-        points = data.get("split_points", data.get("sections", []))
-        return [SplitPoint(start_snippet=p.get("start_snippet", ""), title=p.get("title", "")) 
-                for p in points if p.get("start_snippet")]
+        raw_points = data.get("split_points", data.get("sections", []))
+        
+        result = []
+        for p in raw_points:
+            line_num = p.get("line_number", 0)
+            if not isinstance(line_num, int) or line_num < 1:
+                continue
+            
+            # Verify with fuzzy matching using first_words
+            first_words = p.get("first_words", "")
+            if first_words and line_num - 1 < len(lines):
+                actual_line = lines[line_num - 1]
+                match_score = SequenceMatcher(
+                    None, 
+                    _normalize_text(first_words)[:50], 
+                    _normalize_text(actual_line)[:50]
+                ).ratio()
+                
+                if match_score < 0.5:
+                    # Try to find correct line nearby
+                    corrected_idx, confidence = _find_best_line_match(
+                        lines, first_words, max(0, line_num - 5)
+                    )
+                    if corrected_idx >= 0:
+                        line_num = corrected_idx + 1
+                    else:
+                        continue  # Skip unreliable split point
+            
+            title = p.get("title", "")
+            if title and not title.startswith("#"):
+                title = f"## {title}"
+            
+            result.append(SplitPoint(
+                line_number=line_num,
+                title=title,
+                confidence=0.9
+            ))
+        
+        return result
     except Exception as e:
         print(f"[LLM Split] Error: {e}")
         return []
 
-def _stitch_text_with_headers(raw_text: str, split_points: List[SplitPoint]) -> str:
-    """Insert headers into raw_text at positions identified by split_points."""
-    if not split_points:
-        return raw_text
+def _deduplicate_split_points(points: List[SplitPoint], tolerance: int = 3) -> List[SplitPoint]:
+    """Remove duplicate split points that are too close together."""
+    if not points:
+        return []
     
-    result_parts = []
-    cursor = 0
+    # Sort by line number
+    sorted_points = sorted(points, key=lambda p: p.line_number)
     
-    for point in split_points:
-        if not point.start_snippet:
-            continue
-        
-        found_idx = raw_text.find(point.start_snippet, cursor)
-        if found_idx == -1:
-            partial = point.start_snippet[:50]
-            found_idx = raw_text.find(partial, cursor)
-        
-        if found_idx != -1:
-            result_parts.append(raw_text[cursor:found_idx])
-            result_parts.append(f"\n\n{point.title}\n\n")
-            cursor = found_idx
+    result = [sorted_points[0]]
+    for point in sorted_points[1:]:
+        # Skip if too close to previous point
+        if point.line_number - result[-1].line_number <= tolerance:
+            # Keep the one with higher confidence or better title
+            if point.confidence > result[-1].confidence:
+                result[-1] = point
+        else:
+            result.append(point)
     
-    result_parts.append(raw_text[cursor:])
-    return "".join(result_parts)
+    return result
 
-def _enhance_text_with_llm(text: str, chunk_size: int = 3000) -> str:
-    """Enhance raw markdown by identifying and inserting semantic headers."""
-    all_split_points: List[SplitPoint] = []
+def _stitch_lines_with_headers(lines: List[str], split_points: List[SplitPoint]) -> str:
+    """Insert headers at specified line positions."""
+    if not split_points:
+        return "\n".join(lines)
     
-    for chunk in safe_chunk_generator(text, chunk_size):
-        points = _identify_split_points_llm(chunk)
+    # Deduplicate and sort
+    points = _deduplicate_split_points(split_points)
+    
+    # Build set of line numbers where we insert headers
+    header_map = {p.line_number: p.title for p in points}
+    
+    result_lines = []
+    for i, line in enumerate(lines):
+        line_num = i + 1  # 1-based
+        
+        # Check if we need to insert a header before this line
+        if line_num in header_map:
+            # Don't add header if line already has one
+            if not line.strip().startswith("#"):
+                result_lines.append("")  # Blank line before header
+                result_lines.append(header_map[line_num])
+                result_lines.append("")  # Blank line after header
+        
+        result_lines.append(line)
+    
+    return "\n".join(result_lines)
+
+def _enhance_text_with_llm(text: str, lines_per_chunk: int = 500) -> str:
+    """
+    Enhance raw markdown by identifying and inserting semantic headers.
+    Uses line-based chunking with overlap for context preservation.
+    """
+    lines = text.split("\n")
+    if len(lines) < 5:  # Too short to need enhancement
+        return text
+    
+    all_split_points: List[SplitPoint] = []
+    overlap = 10  # Lines of overlap between chunks
+    
+    start = 0
+    while start < len(lines):
+        end = min(start + lines_per_chunk, len(lines))
+        
+        points = _identify_split_points_llm(lines, start, end)
+        
+        # Adjust line numbers for chunks after the first
+        # (LLM sees relative line numbers, we need absolute)
+        # Note: We send absolute line numbers in the prompt, so no adjustment needed
         all_split_points.extend(points)
+        
+        # Move to next chunk with overlap
+        start = end - overlap if end < len(lines) else end
     
     if not all_split_points:
         return text
     
-    return _stitch_text_with_headers(text, all_split_points)
+    return _stitch_lines_with_headers(lines, all_split_points)
 
 # ------------------------------------------------------------------------------
 # Main Pipeline Wrapper
